@@ -15,6 +15,7 @@ import pyqtgraph as pg
 from collections import deque
 import json
 from pathlib import Path
+import os
 from pypylon import pylon
 import cv2
 from typing import Optional
@@ -83,7 +84,7 @@ class MainWindow(QMainWindow):
             QWidget {
                 background-color: #1b2430;
                 color: #ffffff;
-                font-family: "Segoe UI";
+                font-family: "Segoe UI", "Ubuntu", "Arial", sans-serif;
                 font-size: 12px;
             }
             QGroupBox {
@@ -698,12 +699,16 @@ class MainWindow(QMainWindow):
                 camera_info = {"type": "basler", "index": index, "serial": serial}
                 self.combo_camera.addItem(label, camera_info)
                 cameras.append(camera_info)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error scanning Basler cameras: {e}")
+            # Optionally show in status bar if UI is ready
+            if hasattr(self, 'status_bar'):
+                self._on_status_update(f"Basler scan error: {str(e)}")
 
         # USB cameras
+        backend = cv2.CAP_MSMF if os.name == 'nt' else cv2.CAP_V4L2
         for index in range(10):
-            cap = cv2.VideoCapture(index, cv2.CAP_MSMF)
+            cap = cv2.VideoCapture(index, backend)
             if cap.isOpened():
                 label = f"USB: Device {index}"
                 camera_info = {"type": "usb", "index": index}

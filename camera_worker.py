@@ -122,7 +122,8 @@ class CameraWorker(QThread):
             camera_info = camera_info or {"type": "basler", "index": 0}
             if camera_info.get("type") == "usb":
                 index = int(camera_info.get("index", 0))
-                self.usb_capture = cv2.VideoCapture(index, cv2.CAP_MSMF)
+                backend = cv2.CAP_MSMF if os.name == 'nt' else cv2.CAP_V4L2
+                self.usb_capture = cv2.VideoCapture(index, backend)
                 if not self.usb_capture or not self.usb_capture.isOpened():
                     self.error_occurred.emit("No USB camera found!")
                     return False
