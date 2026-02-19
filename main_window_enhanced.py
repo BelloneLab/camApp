@@ -888,6 +888,7 @@ class MainWindow(QMainWindow):
 
         if self.arduino_worker:
             self.arduino_worker.set_manual_pin_config(pin_map)
+            self.arduino_worker.set_signal_roles(role_map)
 
     def _load_behavior_panel_settings(self):
         """Load saved behavior pin and role settings."""
@@ -930,9 +931,9 @@ class MainWindow(QMainWindow):
 
     def _setup_arduino_worker(self):
         """
-        Initialize and wire the serial worker that talks to the external board.
+        Initialize and wire the Arduino worker that talks to the external board.
 
-        The worker runs in its own QThread so serial I/O does not block the GUI.
+        The worker runs in its own QThread so board I/O does not block the GUI.
         """
         self.arduino_worker = ArduinoOutputWorker()
 

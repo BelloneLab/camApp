@@ -19,6 +19,7 @@
 #include <ESP32Servo.h>
 #define MotorLeverPressA 13
 Servo myservo;  // create servo object to control a servo
+
 int posServo;
 unsigned long DurationCue = 2000; //Duration of the Cue presentation before lever presentation
 
@@ -32,7 +33,6 @@ int LeverPress;
 unsigned long TimeLeverPresentedBegin;
 unsigned long TimeLeverPresentedCurrent;
 unsigned long LeverPressTime;
-
 int Lick;
 int TimeLick;
 int NewCountLick;

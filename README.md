@@ -8,7 +8,7 @@ This app records Basler or USB camera video with synchronized Arduino TTL output
 - Live view with optional ROI cropping
 - Recording with FFmpeg (GPU or CPU encoders)
 - Per-frame metadata logging (timestamp, exposure, GPIO line status when available)
-- Arduino TTL generation and live TTL plot
+- Arduino TTL I/O via pyFirmata with live TTL plot
 - Metadata templates saved to JSON plus TTL history saved to CSV
 
 ## Requirements
@@ -16,7 +16,7 @@ This app records Basler or USB camera video with synchronized Arduino TTL output
 - Windows 10/11
 - Python 3.10+ (recommended: Anaconda or Miniconda)
 - FFmpeg in PATH
-- Arduino with the `arduino_ttl_generator` sketch flashed
+- Arduino with a Firmata sketch flashed (recommended: `StandardFirmata`)
 
 Optional (Basler cameras only):
 - Basler Pylon SDK + `pypylon` (camera drivers)
@@ -77,16 +77,14 @@ Notes:
 python main.py
 ```
 
-## Arduino TTL Generator (Optional)
+## Arduino Firmata Setup (Optional)
 
-1. Open `arduino_ttl_generator/arduino_ttl_generator.ino` in Arduino IDE.
-2. Flash to the Arduino.
-3. Use the UI to scan and connect to the correct port.
+1. Open Arduino IDE.
+2. Load `File > Examples > Firmata > StandardFirmata`.
+3. Flash it to the Arduino.
+4. Use the camApp UI to scan and connect to the correct COM port.
 
-Pin configuration (firmware defaults):
-- Gate: 6, 7
-- 1 Hz Sync: 8, 9
-- Barcode: 10, 11
+Pin mapping is configured directly in the app (`Gate`, `Sync`, `Barcode`, `Lever`, `Cue`, `Reward`, `ITI`) and uses Firmata digital pin read/write.
 
 ## Build camApp.exe
 
