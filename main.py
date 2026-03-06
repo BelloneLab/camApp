@@ -1,8 +1,8 @@
 """
-Camera Control Application
+CamApp
 Main entry point for the application.
 
-Professional desktop application for multi-camera control with:
+Desktop application for camera acquisition with:
 - Real-time live view
 - GPU-accelerated video recording (FFmpeg)
 - Synchronized metadata logging (timestamps, exposure, GPIO status)
@@ -141,8 +141,8 @@ def main():
     _configure_qt_runtime_plugin_paths(qt_plugins_dir)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Camera Control")
-    app.setOrganizationName("Professional Vision Systems")
+    app.setApplicationName("CamApp")
+    app.setOrganizationName("CamApp")
 
     window = MainWindow()
     window.show()

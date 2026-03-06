@@ -1,0 +1,15 @@
+# Python dependencies for camApp
+# Install with: pip install -r requirements.txt
+#
+# Note: FFmpeg is used by the app for recording, but it is not a Python
+# package. Install FFmpeg separately and make sure it is available on PATH.
+
+PySide6
+numpy
+pyqtgraph
+pypylon
+opencv-python
+pandas
+pyserial
+pyfirmata
+matplotlib

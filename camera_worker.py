@@ -52,6 +52,8 @@ class CameraWorker(QThread):
         self.metadata_buffer: List[Dict] = []
         self.recording_filename = ""
         self.frame_counter = 0
+        self.max_record_frames: Optional[int] = None
+        self.camera_reported_fps: Optional[float] = None
 
         # FFmpeg encoder settings
         self.encoder = "h264_nvenc"  # Default to NVIDIA GPU
@@ -90,6 +92,13 @@ class CameraWorker(QThread):
         """Set target FPS for recording output."""
         self.fps_target = float(fps)
 
+    def set_recording_frame_limit(self, max_frames: Optional[int]):
+        """Set an optional hard cap for the number of frames written per recording."""
+        if max_frames is None:
+            self.max_record_frames = None
+            return
+        self.max_record_frames = max(1, int(max_frames))
+
     def update_resolution(self, width: int, height: int):
         """Update cached resolution for recording output."""
         self.width = int(width)
@@ -104,17 +113,22 @@ class CameraWorker(QThread):
         self.line_label_map = label_map or {}
 
     def sync_camera_fps(self):
-        """Sync FPS target from camera if possible."""
+        """Read and cache the camera's reported FPS if available."""
         if self.camera_type == "basler":
             if not self.camera or not self.camera.IsOpen():
-                return
+                self.camera_reported_fps = None
+                return None
             fps = self._read_camera_fps()
             if fps:
-                self.fps_target = fps
+                self.camera_reported_fps = fps
+                return fps
         elif self.camera_type == "usb" and self.usb_capture:
             usb_fps = self.usb_capture.get(cv2.CAP_PROP_FPS)
             if usb_fps and usb_fps > 0:
-                self.fps_target = float(usb_fps)
+                self.camera_reported_fps = float(usb_fps)
+                return self.camera_reported_fps
+        self.camera_reported_fps = None
+        return None
 
     def connect_camera(self, camera_info: Optional[dict] = None) -> bool:
         """Connect to a Basler or USB camera."""
@@ -137,7 +151,7 @@ class CameraWorker(QThread):
                 self.height = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 usb_fps = self.usb_capture.get(cv2.CAP_PROP_FPS)
                 if usb_fps and usb_fps > 0:
-                    self.fps_target = float(usb_fps)
+                    self.camera_reported_fps = float(usb_fps)
 
                 self.status_update.emit(f"USB camera connected: {self.width}x{self.height}")
                 return True
@@ -225,7 +239,7 @@ class CameraWorker(QThread):
                 if self.camera_type == "basler" and self.camera and self.camera.IsOpen():
                     fps = self._read_camera_fps()
                     if fps:
-                        self.fps_target = fps
+                        self.camera_reported_fps = fps
                     try:
                         self.width = int(self.camera.Width.GetValue())
                         self.height = int(self.camera.Height.GetValue())
@@ -234,7 +248,7 @@ class CameraWorker(QThread):
                 elif self.camera_type == "usb" and self.usb_capture:
                     usb_fps = self.usb_capture.get(cv2.CAP_PROP_FPS)
                     if usb_fps and usb_fps > 0:
-                        self.fps_target = float(usb_fps)
+                        self.camera_reported_fps = float(usb_fps)
                     self.width = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
                     self.height = int(self.usb_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -488,6 +502,11 @@ class CameraWorker(QThread):
                 # Emit for TTL sampling (sync with camera frames)
                 self.frame_recorded.emit(metadata)
 
+                if self.max_record_frames is not None and self.frame_counter >= self.max_record_frames:
+                    self.status_update.emit(f"Reached frame target: {self.max_record_frames} frames")
+                    self.stop_recording()
+                    return
+
             except Exception as e:
                 self.error_occurred.emit(f"Frame write error: {str(e)}")
                 self.stop_recording()
@@ -520,6 +539,11 @@ class CameraWorker(QThread):
 
                 self.metadata_buffer.append(metadata.copy())
                 self.frame_recorded.emit(metadata)
+
+                if self.max_record_frames is not None and self.frame_counter >= self.max_record_frames:
+                    self.status_update.emit(f"Reached frame target: {self.max_record_frames} frames")
+                    self.stop_recording()
+                    return
 
             except Exception as e:
                 self.error_occurred.emit(f"Frame write error: {str(e)}")

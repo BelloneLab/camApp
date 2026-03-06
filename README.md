@@ -1,4 +1,4 @@
-# Camera Control App (camApp)
+# CamApp
 
 This app records Basler or USB camera video with synchronized Arduino TTL outputs (gate, barcode, 1 Hz sync), and logs metadata.
 
@@ -81,11 +81,16 @@ python main.py
 1. Open Arduino IDE.
 2. Load `File > Examples > Firmata > StandardFirmata`.
 3. Flash it to the Arduino.
-4. Use the camApp UI to scan and connect to the correct COM port.
+4. Use the CamApp UI to scan and connect to the correct COM port.
 
 Pin mapping is configured directly in the app (`Gate`, `Sync`, `Barcode`, `Lever`, `Cue`, `Reward`, `ITI`) and uses Firmata digital pin read/write.
 
-## Build camApp.exe
+Barcode timing notes:
+- `Gap After Code` is the silent interval after one barcode word finishes.
+- Full barcode cycle time = `start pulse + start low + (bits * bit duration) + gap`.
+- The app no longer depends on legacy custom Arduino sketches in this repo; use `StandardFirmata`.
+
+## Build CamApp.exe
 
 Install build tool:
 
@@ -96,13 +101,13 @@ pip install pyinstaller
 Build a single-file EXE:
 
 ```powershell
-pyinstaller --onefile --noconsole --name camApp main.py
+pyinstaller --onefile --noconsole --name CamApp main.py
 ```
 
-The output will be in `dist/camApp.exe`. Copy it to the project root if desired:
+The output will be in `dist/CamApp.exe`. Copy it to the project root if desired:
 
 ```powershell
-copy dist\camApp.exe .\
+copy dist\CamApp.exe .\
 ```
 
 Note: The compiled EXE still requires FFmpeg available on PATH at runtime.

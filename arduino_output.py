@@ -1,5 +1,5 @@
 """
-Arduino TTL communication worker for camApp using pyFirmata.
+Arduino TTL communication worker for CamApp using pyFirmata.
 
 This worker keeps the same GUI-facing API as the former pyserial-based worker,
 but reads/writes digital signals through Firmata pins.
@@ -60,14 +60,14 @@ class ArduinoOutputWorker(QThread):
         "reward": "Output",
         "iti": "Output",
     }
-    # Keep TTL timing close to arduino_ttl_generator.ino
+    # Host-side TTL timing parameters.
     SYNC_1HZ_PERIOD_S = 1.0
     SYNC_1HZ_PULSE_S = 0.05
     BARCODE_BITS = 32
     BARCODE_START_PULSE_S = 0.1
     BARCODE_START_LOW_S = 0.1
     BARCODE_BIT_S = 0.1
-    BARCODE_INTERVAL_S = 5.0
+    BARCODE_INTERVAL_S = 5.0  # Gap after one barcode word before the next starts.
     BC_START_HI = 0
     BC_START_LO = 1
     BC_BITS = 2
@@ -100,8 +100,6 @@ class ArduinoOutputWorker(QThread):
         self.pin_config = {key: pins.copy() for key, pins in self.DEFAULT_PIN_CONFIG.items()}
         self.signal_roles = self.DEFAULT_SIGNAL_ROLES.copy()
         self.pin_handles: Dict[str, List[Any]] = {key: [] for key in self.DEFAULT_PIN_CONFIG}
-        self.passive_monitor_mode = False
-        self.transient_high_until = {key: 0.0 for key in self.SIGNAL_KEYS}
         self.output_shadow = {key: False for key in self.SIGNAL_KEYS}
 
         self.generation_mode = "idle"
@@ -135,10 +133,26 @@ class ArduinoOutputWorker(QThread):
         self.sync_pins = self.pin_config["sync"].copy()
         self.barcode_pins = self.pin_config["barcode"].copy()
 
-        self.settings = QSettings("BaslerCam", "CameraApp")
+        self.settings = QSettings("CamApp", "CamApp")
+        self._migrate_legacy_settings()
         self.load_settings()
 
     # ===== Settings / Config =====
+
+    def _migrate_legacy_settings(self):
+        """Copy saved settings from the previous app identity once."""
+        legacy_settings = QSettings("BaslerCam", "CameraApp")
+        existing_keys = set(self.settings.allKeys())
+        copied = False
+
+        for key in legacy_settings.allKeys():
+            if key in existing_keys:
+                continue
+            self.settings.setValue(key, legacy_settings.value(key))
+            copied = True
+
+        if copied:
+            self.settings.sync()
 
     def load_settings(self):
         """Load saved Arduino/Firmata settings."""
@@ -198,7 +212,7 @@ class ArduinoOutputWorker(QThread):
             ),
         )
         self.BARCODE_INTERVAL_S = max(
-            0.01,
+            0.0,
             self._safe_float(
                 self.settings.value("barcode_interval_s", self.BARCODE_INTERVAL_S),
                 self.BARCODE_INTERVAL_S,
@@ -283,12 +297,15 @@ class ArduinoOutputWorker(QThread):
     def get_barcode_parameters(self) -> Dict[str, float]:
         """Return barcode state-machine parameters."""
         with QMutexLocker(self.mutex):
+            word_duration = self._barcode_word_duration_seconds()
             return {
                 "bits": int(self.BARCODE_BITS),
                 "start_pulse_s": float(self.BARCODE_START_PULSE_S),
                 "start_low_s": float(self.BARCODE_START_LOW_S),
                 "bit_s": float(self.BARCODE_BIT_S),
                 "interval_s": float(self.BARCODE_INTERVAL_S),
+                "word_duration_s": float(word_duration),
+                "cycle_duration_s": float(word_duration + self.BARCODE_INTERVAL_S),
             }
 
     def set_barcode_parameters(
@@ -305,7 +322,7 @@ class ArduinoOutputWorker(QThread):
             self.BARCODE_START_PULSE_S = max(0.001, float(start_pulse_s))
             self.BARCODE_START_LOW_S = max(0.001, float(start_low_s))
             self.BARCODE_BIT_S = max(0.001, float(bit_s))
-            self.BARCODE_INTERVAL_S = max(0.01, float(interval_s))
+            self.BARCODE_INTERVAL_S = max(0.0, float(interval_s))
             self.save_settings()
             if self.is_generating:
                 self._reset_signal_generators_locked(time.time())
@@ -393,12 +410,10 @@ class ArduinoOutputWorker(QThread):
                 self.port_name = port_name
                 self.baud_rate = 57600
                 self.is_generating = False
-                self.passive_monitor_mode = False
                 self.generation_mode = "idle"
                 self.generation_start_time = 0.0
                 self.current_states = {key: False for key in self.SIGNAL_KEYS}
                 self.output_shadow = {key: False for key in self.SIGNAL_KEYS}
-                self.transient_high_until = {key: 0.0 for key in self.SIGNAL_KEYS}
                 self._reset_ttl_event_tracking()
                 self._configure_pin_handles_locked()
                 self.save_settings()
@@ -437,12 +452,10 @@ class ArduinoOutputWorker(QThread):
         self.serial_port = None
         self.pin_handles = {key: [] for key in self.DEFAULT_PIN_CONFIG}
         self.is_generating = False
-        self.passive_monitor_mode = False
         self.generation_mode = "idle"
         self.generation_start_time = 0.0
         self.current_states = {key: False for key in self.SIGNAL_KEYS}
         self.output_shadow = {key: False for key in self.SIGNAL_KEYS}
-        self.transient_high_until = {key: 0.0 for key in self.SIGNAL_KEYS}
         self._reset_signal_generators_locked(time.time())
         self._reset_ttl_event_tracking()
         return board
@@ -623,7 +636,6 @@ class ArduinoOutputWorker(QThread):
             now = time.time()
             self._set_all_outputs_low_locked()
             self.is_generating = True
-            self.passive_monitor_mode = False
             self.generation_mode = "recording"
             self.generation_start_time = now
             self._reset_signal_generators_locked(now)
@@ -632,17 +644,11 @@ class ArduinoOutputWorker(QThread):
             return True
 
     def stop_recording(self):
-        """Stop recording mode output generation."""
+        """Stop recording mode output generation without discarding collected telemetry."""
         with QMutexLocker(self.mutex):
             if self.board is None:
                 return False
-            self.is_generating = False
-            self.passive_monitor_mode = False
-            self.generation_mode = "idle"
-            self.generation_start_time = 0.0
-            self._set_all_outputs_low_locked()
-            self._reset_signal_generators_locked(time.time())
-            self._reset_ttl_event_tracking()
+            self._stop_generation_locked()
             return True
 
     def start_test(self):
@@ -653,7 +659,6 @@ class ArduinoOutputWorker(QThread):
             now = time.time()
             self._set_all_outputs_low_locked()
             self.is_generating = True
-            self.passive_monitor_mode = False
             self.generation_mode = "test"
             self.generation_start_time = now
             self._reset_signal_generators_locked(now)
@@ -661,17 +666,11 @@ class ArduinoOutputWorker(QThread):
             return True
 
     def stop_test(self):
-        """Stop test mode generation/monitoring."""
+        """Stop test mode generation/monitoring without clearing counters immediately."""
         with QMutexLocker(self.mutex):
             if self.board is None:
                 return False
-            self.is_generating = False
-            self.passive_monitor_mode = False
-            self.generation_mode = "idle"
-            self.generation_start_time = 0.0
-            self._set_all_outputs_low_locked()
-            self._reset_signal_generators_locked(time.time())
-            self._reset_ttl_event_tracking()
+            self._stop_generation_locked()
             return True
 
     # ===== Data Sampling =====
@@ -934,13 +933,30 @@ class ArduinoOutputWorker(QThread):
         self.barcode_bit_index = 0
         self.barcode_word = 0
 
-    def _barcode_gap_seconds(self) -> float:
-        used = (
-            self.BARCODE_START_PULSE_S
-            + self.BARCODE_START_LOW_S
-            + (self.BARCODE_BITS * self.BARCODE_BIT_S)
+    def _stop_generation_locked(self):
+        """Stop generated outputs but keep collected history/counters available to the GUI."""
+        self.is_generating = False
+        self.generation_mode = "idle"
+        self.generation_start_time = 0.0
+        self._set_all_outputs_low_locked()
+        self._reset_signal_generators_locked(time.time())
+
+    def _barcode_word_duration_seconds(self) -> float:
+        """Return the active duration of one barcode word excluding the configured inter-code gap."""
+        return (
+            float(self.BARCODE_START_PULSE_S)
+            + float(self.BARCODE_START_LOW_S)
+            + (float(self.BARCODE_BITS) * float(self.BARCODE_BIT_S))
         )
-        return max(0.0, self.BARCODE_INTERVAL_S - used)
+
+    def _barcode_gap_seconds(self) -> float:
+        """
+        Return the silent gap after one barcode word.
+
+        The UI exposes this as the interval between barcode words, so it should
+        be interpreted literally rather than as a total start-to-start period.
+        """
+        return max(0.0, float(self.BARCODE_INTERVAL_S))
 
     def _set_barcode_level_locked(self, value: bool):
         self._write_output_signal_locked("barcode0", value)
@@ -1178,10 +1194,6 @@ class ArduinoOutputWorker(QThread):
             return float(str(value).strip())
         except Exception:
             return default
-
-    def _safe_bool_int(self, value, default=0) -> int:
-        parsed = self._safe_int(value, default=default)
-        return 1 if int(parsed) != 0 else 0
 
     # ===== Public Data Accessors =====
 
