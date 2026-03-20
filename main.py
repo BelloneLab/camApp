@@ -135,17 +135,40 @@ def main():
     _prefer_environment_site_packages()
     qt_plugins_dir = _configure_qt_plugin_environment()
 
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QSplashScreen
+    from branding import load_app_icon, load_splash_pixmap, preferred_app_font, set_windows_app_id
     from main_window_enhanced import MainWindow
 
     _configure_qt_runtime_plugin_paths(qt_plugins_dir)
 
+    set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("CamApp")
     app.setOrganizationName("CamApp")
+    app.setFont(preferred_app_font())
+
+    app_icon = load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+
+    splash = None
+    splash_pixmap = load_splash_pixmap()
+    if not splash_pixmap.isNull():
+        splash = QSplashScreen(
+            splash_pixmap,
+            Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint,
+        )
+        splash.setMask(splash_pixmap.mask())
+        splash.show()
+        app.processEvents()
 
     window = MainWindow()
+    if not app_icon.isNull():
+        window.setWindowIcon(app_icon)
     window.show()
+    if splash is not None:
+        splash.finish(window)
 
     sys.exit(app.exec())
 

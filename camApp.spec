@@ -37,12 +37,16 @@ qt_datas = collect_data_files(
         "plugins/platformthemes/*",
     ],
 )
+branding_datas = [
+    ("assets/camapp_icon.png", "assets"),
+    ("assets/camapp_splash.png", "assets"),
+]
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=extra_binaries,
-    datas=qt_datas,
+    datas=qt_datas + branding_datas,
     hiddenimports=[
         "PySide6.QtOpenGL",
     ],
@@ -74,4 +78,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=os.path.join("assets", "camapp.ico"),
 )

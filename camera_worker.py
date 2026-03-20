@@ -29,6 +29,7 @@ class CameraWorker(QThread):
     error_occurred = Signal(str)
     recording_stopped = Signal()
     frame_recorded = Signal(dict)  # Signal for each recorded frame with metadata
+    frame_drop_stats_updated = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -72,12 +73,105 @@ class CameraWorker(QThread):
         self.fps_frame_count = 0
         self.fps_last_time = time.time()
         self.line_label_map: Dict[str, str] = {}
-
+        self.frame_timing_reference_fps = 0.0
+        self.frame_timing_expected_interval = 0.0
+        self.frame_timing_last_timestamp: Optional[float] = None
+        self.frame_timing_interval_sum = 0.0
+        self.frame_timing_interval_count = 0
+        self.frame_timing_max_gap = 0.0
+        self.frame_timing_last_interval = 0.0
+        self.frame_drop_estimate = 0
+        self.recording_started_at: Optional[float] = None
+        self.last_recording_stats: Dict[str, object] = {}
+        self._reset_frame_drop_stats()
     def set_encoder(self, encoder: str, preset: str = "p4", bitrate: str = "5M"):
         """Set FFmpeg encoder and parameters."""
         self.encoder = encoder
         self.encoder_preset = preset
         self.bitrate = bitrate
+
+    def _reset_frame_drop_stats(self):
+        """Reset frame-timing counters for a new recording session."""
+        reference_fps = float(self.camera_reported_fps or self.fps_target or 0.0)
+        if reference_fps <= 0:
+            reference_fps = 30.0
+
+        self.frame_timing_reference_fps = reference_fps
+        self.frame_timing_expected_interval = 1.0 / reference_fps if reference_fps > 0 else 0.0
+        self.frame_timing_last_timestamp = None
+        self.frame_timing_interval_sum = 0.0
+        self.frame_timing_interval_count = 0
+        self.frame_timing_max_gap = 0.0
+        self.frame_timing_last_interval = 0.0
+        self.frame_drop_estimate = 0
+        self.recording_started_at = None
+        self.last_recording_stats = self._build_frame_drop_stats(active=False)
+
+    def _build_frame_drop_stats(self, active: Optional[bool] = None) -> Dict[str, object]:
+        """Build a snapshot of current frame-drop estimates for UI and file export."""
+        recorded_frames = int(self.frame_counter)
+        estimated_total_frames = recorded_frames + int(self.frame_drop_estimate)
+        drop_percent = 0.0
+        if estimated_total_frames > 0:
+            drop_percent = (float(self.frame_drop_estimate) / float(estimated_total_frames)) * 100.0
+
+        average_interval_ms = 0.0
+        if self.frame_timing_interval_count > 0:
+            average_interval_ms = (self.frame_timing_interval_sum / self.frame_timing_interval_count) * 1000.0
+
+        elapsed_seconds = 0.0
+        if self.recording_started_at is not None:
+            elapsed_seconds = max(0.0, time.time() - self.recording_started_at)
+
+        return {
+            "active": self.is_recording if active is None else bool(active),
+            "recorded_frames": recorded_frames,
+            "estimated_dropped_frames": int(self.frame_drop_estimate),
+            "estimated_total_frames": int(estimated_total_frames),
+            "drop_percent": float(drop_percent),
+            "reference_fps": float(self.frame_timing_reference_fps),
+            "expected_interval_ms": float(self.frame_timing_expected_interval * 1000.0),
+            "average_interval_ms": float(average_interval_ms),
+            "max_gap_ms": float(self.frame_timing_max_gap * 1000.0),
+            "last_interval_ms": float(self.frame_timing_last_interval * 1000.0),
+            "elapsed_seconds": float(elapsed_seconds),
+            "timestamp_source": "software",
+            "camera_type": self.camera_type or "",
+        }
+
+    def _emit_frame_drop_stats(self, active: Optional[bool] = None):
+        """Publish current frame-drop statistics."""
+        self.last_recording_stats = self._build_frame_drop_stats(active=active)
+        self.frame_drop_stats_updated.emit(dict(self.last_recording_stats))
+
+    def _track_recorded_frame_timing(self, metadata: Dict):
+        """Estimate dropped frames from gaps between recorded-frame timestamps."""
+        timestamp_raw = metadata.get("timestamp_software")
+        try:
+            timestamp_value = float(timestamp_raw)
+        except (TypeError, ValueError):
+            timestamp_value = time.time()
+
+        if self.recording_started_at is None:
+            self.recording_started_at = timestamp_value
+
+        if self.frame_timing_last_timestamp is not None:
+            interval = max(0.0, timestamp_value - self.frame_timing_last_timestamp)
+            self.frame_timing_last_interval = interval
+            self.frame_timing_interval_sum += interval
+            self.frame_timing_interval_count += 1
+            self.frame_timing_max_gap = max(self.frame_timing_max_gap, interval)
+
+            if self.frame_timing_expected_interval > 0:
+                interval_ratio = interval / self.frame_timing_expected_interval
+                if interval_ratio >= 1.5:
+                    missing_frames = max(int(interval_ratio + 0.5) - 1, 0)
+                    self.frame_drop_estimate += missing_frames
+
+        self.frame_timing_last_timestamp = timestamp_value
+
+        if self.frame_counter <= 3 or self.frame_counter % 30 == 0:
+            self._emit_frame_drop_stats(active=True)
 
     def set_image_format(self, image_format: str):
         """Set image format for recording/display."""
@@ -255,11 +349,14 @@ class CameraWorker(QThread):
                 self.recording_filename = filename
                 self.metadata_buffer = []
                 self.frame_counter = 0
+                self._reset_frame_drop_stats()
 
                 # Start FFmpeg
                 self._start_ffmpeg()
 
                 self.is_recording = True
+                self.recording_started_at = time.time()
+                self._emit_frame_drop_stats(active=True)
                 self.status_update.emit(f"Recording: {Path(filename).name}.mp4")
                 return True
 
@@ -361,6 +458,7 @@ class CameraWorker(QThread):
 
             try:
                 self.is_recording = False
+                self._emit_frame_drop_stats(active=False)
 
                 # Close FFmpeg
                 if self.ffmpeg_process:
@@ -495,6 +593,7 @@ class CameraWorker(QThread):
                 # Add frame ID
                 metadata['frame_id'] = self.frame_counter
                 self.frame_counter += 1
+                self._track_recorded_frame_timing(metadata)
 
                 # Buffer metadata
                 self.metadata_buffer.append(metadata.copy())
@@ -536,6 +635,7 @@ class CameraWorker(QThread):
 
                 metadata['frame_id'] = self.frame_counter
                 self.frame_counter += 1
+                self._track_recorded_frame_timing(metadata)
 
                 self.metadata_buffer.append(metadata.copy())
                 self.frame_recorded.emit(metadata)

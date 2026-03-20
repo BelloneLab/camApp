@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QCheckBox, QToolButton, QDialog, QStackedWidget,
                                QDialogButtonBox, QStyle, QToolBar,
                                QTableWidget, QTableWidgetItem, QHeaderView,
-                               QAbstractItemView, QMessageBox)
+                               QAbstractItemView, QMessageBox, QSizePolicy)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF
 from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
                            QBrush, QPainterPath, QLinearGradient)
@@ -111,9 +111,14 @@ class MainWindow(QMainWindow):
         self.live_status_badge: Optional[QLabel] = None
         self.label_ttl_status: Optional[QLabel] = None
         self.label_behavior_status: Optional[QLabel] = None
+        self.label_frame_drop_summary: Optional[QLabel] = None
+        self.frame_drop_log: Optional[QTextEdit] = None
         self.live_placeholder_auto_ranged = False
         self.live_frame_auto_ranged = False
         self.roi_item: Optional[pg.RectROI] = None
+        self.frame_drop_events = deque(maxlen=4)
+        self.last_frame_drop_stats: Dict[str, object] = {}
+        self.last_frame_drop_log_signature = None
         self.metadata_dock: Optional[QWidget] = None
         self.camera_dock: Optional[QWidget] = None
         self.session_dock: Optional[QWidget] = None
@@ -184,8 +189,8 @@ class MainWindow(QMainWindow):
             QWidget {
                 background-color: transparent;
                 color: #eef6ff;
-                font-family: "Segoe UI Variable Text", "Bahnschrift", "Segoe UI";
-                font-size: 12px;
+                font-family: "Arial Narrow", Arial, "Segoe UI";
+                font-size: 11px;
             }
             QWidget#AppShell {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -240,11 +245,11 @@ class MainWindow(QMainWindow):
                     stop:0 #2488ff, stop:1 #2563eb);
                 color: white;
                 border: 1px solid #5aa7ff;
-                border-radius: 18px;
-                padding: 11px 16px;
+                border-radius: 15px;
+                padding: 5px 12px;
                 font-weight: 700;
-                font-size: 13px;
-                min-height: 20px;
+                font-size: 12px;
+                min-height: 10px;
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -287,14 +292,14 @@ class MainWindow(QMainWindow):
             QToolButton#navButton {
                 background: #0d1725;
                 border: 1px solid #22344e;
-                border-radius: 22px;
-                padding: 10px 6px;
-                min-width: 78px;
-                max-width: 78px;
-                min-height: 78px;
+                border-radius: 20px;
+                padding: 8px 5px;
+                min-width: 68px;
+                max-width: 68px;
+                min-height: 70px;
                 color: #9bb4d2;
                 font-weight: 700;
-                font-size: 12px;
+                font-size: 11px;
             }
             QToolButton#navButton:hover {
                 background: #122033;
@@ -310,10 +315,10 @@ class MainWindow(QMainWindow):
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QTableWidget {
                 background-color: #07101a;
                 border: 1px solid #243851;
-                border-radius: 14px;
+                border-radius: 12px;
                 color: #eef6ff;
-                padding: 7px 10px;
-                min-height: 22px;
+                padding: 5px 8px;
+                min-height: 20px;
             }
             QComboBox::drop-down {
                 border: none;
@@ -410,11 +415,11 @@ class MainWindow(QMainWindow):
 
         camera_page = self._create_camera_connection_panel()
         settings_page = self._create_general_settings_panel()
-        session_page = self._create_session_hub_panel()
+        session_page = self._wrap_scroll_dock_widget(self._create_session_hub_panel())
         file_page = self._create_file_tools_panel()
         ttl_page = self._create_ttl_monitor_panel()
         behavior_page = self._create_behavior_monitor_panel()
-        arduino_page = self._create_behavior_setup_panel()
+        arduino_page = self._wrap_scroll_dock_widget(self._create_behavior_setup_panel())
         self._rebuild_monitor_visuals(reset_plot=True)
 
         self.left_panel_pages = {
@@ -439,8 +444,9 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(left_rail)
         root_layout.addWidget(self.left_panel_shell)
         root_layout.addWidget(center_workspace, 1)
-        root_layout.addWidget(self.right_panel_shell)
         root_layout.addWidget(right_rail)
+        root_layout.addWidget(self.right_panel_shell)
+        self._update_side_panel_bounds()
 
         self.metadata_dock = self.left_panel_shell
         self.camera_dock = camera_page
@@ -473,7 +479,7 @@ class MainWindow(QMainWindow):
         """Create one vertical navigation rail."""
         rail = QFrame()
         rail.setObjectName("SideRail")
-        rail.setFixedWidth(96)
+        rail.setFixedWidth(84)
         layout = QVBoxLayout(rail)
         layout.setContentsMargins(8, 12, 8, 12)
         layout.setSpacing(12)
@@ -509,12 +515,9 @@ class MainWindow(QMainWindow):
         """Create a collapsible side shell with header and stacked pages."""
         shell = QFrame()
         shell.setObjectName("PanelShell")
-        if side == "left":
-            shell.setMinimumWidth(390)
-            shell.setMaximumWidth(560)
-        else:
-            shell.setMinimumWidth(360)
-            shell.setMaximumWidth(500)
+        shell.setMinimumWidth(320)
+        shell.setMaximumWidth(440)
+        shell.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         shell.setVisible(False)
 
         layout = QVBoxLayout(shell)
@@ -560,6 +563,35 @@ class MainWindow(QMainWindow):
             self.settings.setValue("metadata_panel_visible", 0)
         else:
             self.current_right_panel_key = None
+
+    def _update_side_panel_bounds(self):
+        """Adjust side-drawer widths to remain readable across window sizes."""
+        window_width = max(0, self.width())
+        if window_width >= 1850:
+            left_bounds = (360, 460)
+            right_bounds = (360, 460)
+        elif window_width >= 1600:
+            left_bounds = (330, 420)
+            right_bounds = (330, 410)
+        else:
+            left_bounds = (300, 360)
+            right_bounds = (300, 360)
+
+        if self.left_panel_shell is not None:
+            self.left_panel_shell.setMinimumWidth(left_bounds[0])
+            self.left_panel_shell.setMaximumWidth(left_bounds[1])
+        if self.right_panel_shell is not None:
+            self.right_panel_shell.setMinimumWidth(right_bounds[0])
+            self.right_panel_shell.setMaximumWidth(right_bounds[1])
+
+    def _ensure_side_panel_fit(self, side: str):
+        """Keep side panels usable on narrower windows by collapsing the opposite drawer."""
+        if self.width() >= 1760:
+            return
+        other_side = "right" if side == "left" else "left"
+        other_shell = self.right_panel_shell if side == "left" else self.left_panel_shell
+        if other_shell is not None and other_shell.isVisible():
+            self._hide_side_panel(other_side)
 
     def _create_nav_button(self, label: str, icon_kind: str, accent: str) -> QToolButton:
         """Create one modern navigation button with a custom icon."""
@@ -607,6 +639,7 @@ class MainWindow(QMainWindow):
                 self.current_right_panel_key = None
             return
 
+        self._ensure_side_panel_fit(side)
         shell.setVisible(True)
         stack.setCurrentWidget(pages[panel_key])
         title_label.setText(title)
@@ -624,12 +657,16 @@ class MainWindow(QMainWindow):
     def _create_center_workspace(self) -> QWidget:
         """Build the central live-view and recording workspace."""
         container = QWidget()
+        container.setMinimumWidth(0)
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
         live_card = QFrame()
         live_card.setObjectName("WorkspaceCard")
+        live_card.setMinimumWidth(0)
+        live_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         live_layout = QVBoxLayout(live_card)
         live_layout.setContentsMargins(12, 12, 12, 12)
         live_layout.addWidget(self._create_live_view_panel(), 1)
@@ -639,12 +676,16 @@ class MainWindow(QMainWindow):
 
         acquisition_card = QFrame()
         acquisition_card.setObjectName("WorkspaceCard")
+        acquisition_card.setMinimumWidth(0)
+        acquisition_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         acquisition_layout = QVBoxLayout(acquisition_card)
         acquisition_layout.setContentsMargins(14, 14, 14, 14)
         acquisition_layout.addWidget(self._create_camera_settings())
 
         session_card = QFrame()
         session_card.setObjectName("WorkspaceCard")
+        session_card.setMinimumWidth(0)
+        session_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         session_layout = QVBoxLayout(session_card)
         session_layout.setContentsMargins(14, 14, 14, 14)
         session_layout.addWidget(self._create_control_panel())
@@ -675,12 +716,8 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return tile, value_label
 
-    def _build_modern_icon(self, kind: str, accent: str) -> QIcon:
-        """Draw a simple modern line icon used by tool rails and key actions."""
-        pixmap = QPixmap(32, 32)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
+    def _paint_modern_icon(self, painter: QPainter, kind: str, accent: str):
+        """Paint one icon glyph into a normalized 32x32 canvas."""
         pen = QPen(QColor(accent), 2.3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
@@ -763,8 +800,23 @@ class MainWindow(QMainWindow):
         else:
             painter.drawRoundedRect(QRectF(7, 7, 18, 18), 5, 5)
 
-        painter.end()
-        return QIcon(pixmap)
+    def _build_modern_icon(self, kind: str, accent: str) -> QIcon:
+        """Build a multi-size icon so Qt stays crisp on higher-DPI displays."""
+        icon = QIcon()
+        for size in (16, 18, 20, 24, 28, 32, 48, 64):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHints(
+                QPainter.Antialiasing
+                | QPainter.SmoothPixmapTransform
+                | QPainter.TextAntialiasing
+            )
+            painter.scale(size / 32.0, size / 32.0)
+            self._paint_modern_icon(painter, kind, accent)
+            painter.end()
+            icon.addPixmap(pixmap)
+        return icon
 
     def _wrap_scroll_dock_widget(self, widget: QWidget) -> QWidget:
         """Wrap tall configuration widgets so docks remain usable on smaller screens."""
@@ -802,6 +854,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
         subtitle = QLabel("Choose a Basler or USB source, then arm the live workspace.")
         subtitle.setStyleSheet("color: #8fa6bf;")
+        subtitle.setWordWrap(True)
         hero_layout.addWidget(title)
         hero_layout.addWidget(subtitle)
 
@@ -819,7 +872,7 @@ class MainWindow(QMainWindow):
         self.btn_connect = QPushButton("Connect Camera")
         self._set_button_icon(self.btn_connect, "play", "#eef6ff")
         self.btn_connect.clicked.connect(self._on_connect_clicked)
-        self.btn_connect.setMinimumHeight(42)
+        self.btn_connect.setMinimumHeight(36)
         button_row.addWidget(self.btn_connect, 1)
         hero_layout.addLayout(button_row)
 
@@ -848,6 +901,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
         subtitle = QLabel("Control filename assembly and open the advanced camera popup.")
         subtitle.setStyleSheet("color: #8fa6bf;")
+        subtitle.setWordWrap(True)
         card_layout.addWidget(title)
         card_layout.addWidget(subtitle)
 
@@ -896,6 +950,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
         subtitle = QLabel("Planner rows now drive the active recording session and filename.")
         subtitle.setStyleSheet("color: #8fa6bf;")
+        subtitle.setWordWrap(True)
         overview_layout.addWidget(title)
         overview_layout.addWidget(subtitle)
 
@@ -959,6 +1014,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #eef6ff;")
         subtitle = QLabel("Choose the save root and export reusable session presets.")
         subtitle.setStyleSheet("color: #8fa6bf;")
+        subtitle.setWordWrap(True)
         card_layout.addWidget(title)
         card_layout.addWidget(subtitle)
 
@@ -1100,6 +1156,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.live_header_mode)
         header_layout.addWidget(self.live_header_roi)
         layout.addWidget(header)
+        layout.addWidget(self._create_frame_drop_panel())
 
         plot_item = pg.PlotItem()
         plot_item.hideAxis("left")
@@ -1114,10 +1171,60 @@ class MainWindow(QMainWindow):
         self.live_image_view.ui.histogram.hide()
         self.live_image_view.ui.roiPlot.hide()
         self.live_image_view.ui.normGroup.hide()
-        self.live_image_view.setMinimumSize(720, 480)
+        self.live_image_view.setMinimumWidth(0)
+        self.live_image_view.setMinimumHeight(420)
+        self.live_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.live_image_view, stretch=1)
 
         self._show_live_placeholder("CamApp", "Connect a camera to begin preview")
+        return panel
+
+    def _create_frame_drop_panel(self) -> QWidget:
+        """Create a compact live panel for frame-drop statistics."""
+        panel = QFrame()
+        panel.setObjectName("WorkspaceSubCard")
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(12)
+
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+
+        title = QLabel("Frame Drop Monitor")
+        title.setStyleSheet("color: #8dd0ff; font-size: 11px; font-weight: 700;")
+        self.label_frame_drop_summary = QLabel("")
+        self.label_frame_drop_summary.setStyleSheet("color: #dce8f4; font-weight: 700;")
+        text_layout.addWidget(title)
+        text_layout.addWidget(self.label_frame_drop_summary)
+
+        self.frame_drop_log = QTextEdit()
+        self.frame_drop_log.setReadOnly(True)
+        self.frame_drop_log.setLineWrapMode(QTextEdit.NoWrap)
+        self.frame_drop_log.setFocusPolicy(Qt.NoFocus)
+        self.frame_drop_log.setFixedHeight(54)
+        self.frame_drop_log.setMinimumWidth(240)
+        self.frame_drop_log.setMaximumWidth(320)
+        self.frame_drop_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.frame_drop_log.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.frame_drop_log.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.frame_drop_log.setStyleSheet(
+            """
+            QTextEdit {
+                background-color: #07111b;
+                border: 1px solid #24405f;
+                border-radius: 12px;
+                color: #9dd9ff;
+                font-family: "Arial Narrow", Arial, "Consolas";
+                font-size: 10px;
+                padding: 4px 6px;
+            }
+            """
+        )
+
+        layout.addLayout(text_layout, 1)
+        layout.addWidget(self.frame_drop_log)
+        self._reset_frame_drop_display()
         return panel
 
     def _create_trial_planner_panel(self) -> QWidget:
@@ -1137,62 +1244,72 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #edf4ff;")
         subtitle = QLabel("Edit metadata directly in the table. Select a row to make it the active recording plan.")
         subtitle.setStyleSheet("color: #8da6bf;")
+        subtitle.setWordWrap(True)
         header_text = QVBoxLayout()
         header_text.addWidget(title)
         header_text.addWidget(subtitle)
         header_layout.addLayout(header_text)
         header_layout.addStretch()
 
-        self.btn_planner_fit = QPushButton("Fit Columns")
+        self.btn_planner_fit = QPushButton("Fit")
         self._set_button_icon(self.btn_planner_fit, "settings", "#33d5ff", "ghostButton")
         self.btn_planner_fit.clicked.connect(self._fit_planner_columns)
         header_layout.addWidget(self.btn_planner_fit)
 
-        self.btn_planner_detach = QPushButton("Detach Planner")
+        self.btn_planner_detach = QPushButton("Detach")
         self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "orangeButton")
         self.btn_planner_detach.clicked.connect(self._toggle_planner_detach)
         header_layout.addWidget(self.btn_planner_detach)
         layout.addWidget(header)
 
         button_grid = QGridLayout()
-        button_grid.setHorizontalSpacing(10)
-        button_grid.setVerticalSpacing(10)
+        button_grid.setHorizontalSpacing(8)
+        button_grid.setVerticalSpacing(8)
 
         self.btn_planner_add_trials = QPushButton("Add Trials")
         self._set_button_icon(self.btn_planner_add_trials, "plus", "#35d2ff")
-        self.btn_planner_add_trials.setMinimumWidth(138)
         self.btn_planner_add_trials.clicked.connect(self._add_planner_trials)
-        button_grid.addWidget(self.btn_planner_add_trials, 0, 0)
 
         self.btn_planner_add_variable = QPushButton("Add Variable")
         self._set_button_icon(self.btn_planner_add_variable, "session", "#d86cff", "violetButton")
-        self.btn_planner_add_variable.setMinimumWidth(138)
         self.btn_planner_add_variable.clicked.connect(self._add_planner_variable)
-        button_grid.addWidget(self.btn_planner_add_variable, 0, 1)
 
         self.btn_planner_import = QPushButton("Import CSV")
         self._set_button_icon(self.btn_planner_import, "import", "#33d5ff", "ghostButton")
-        self.btn_planner_import.setMinimumWidth(138)
         self.btn_planner_import.clicked.connect(self._import_planner_trials)
-        button_grid.addWidget(self.btn_planner_import, 0, 2)
 
         self.btn_planner_export = QPushButton("Export CSV")
         self._set_button_icon(self.btn_planner_export, "export", "#ffb35d", "ghostButton")
-        self.btn_planner_export.setMinimumWidth(138)
         self.btn_planner_export.clicked.connect(self._export_planner_trials)
-        button_grid.addWidget(self.btn_planner_export, 1, 0)
 
-        self.btn_planner_apply = QPushButton("Use Selected Trial")
+        self.btn_planner_apply = QPushButton("Use Selected")
         self._set_button_icon(self.btn_planner_apply, "check", "#6fe06e", "ghostButton")
-        self.btn_planner_apply.setMinimumWidth(138)
         self.btn_planner_apply.clicked.connect(self._apply_selected_planner_trial)
-        button_grid.addWidget(self.btn_planner_apply, 1, 1)
 
         self.btn_planner_remove = QPushButton("Remove")
         self._set_button_icon(self.btn_planner_remove, "record", "#ff6c9e", "dangerButton")
-        self.btn_planner_remove.setMinimumWidth(138)
         self.btn_planner_remove.clicked.connect(self._remove_selected_planner_trials)
-        button_grid.addWidget(self.btn_planner_remove, 1, 2)
+
+        planner_buttons = [
+            self.btn_planner_add_trials,
+            self.btn_planner_add_variable,
+            self.btn_planner_import,
+            self.btn_planner_export,
+            self.btn_planner_apply,
+            self.btn_planner_remove,
+        ]
+        planner_positions = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+        ]
+        for button, (row, col) in zip(planner_buttons, planner_positions):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button_grid.addWidget(button, row, col)
         layout.addLayout(button_grid)
 
         self.planner_table = QTableWidget(0, 0)
@@ -1371,6 +1488,7 @@ class MainWindow(QMainWindow):
         self.btn_advanced = QPushButton("Advanced Controls")
         self._set_button_icon(self.btn_advanced, "settings", "#d86cff", "violetButton")
         self.btn_advanced.clicked.connect(self._toggle_advanced_settings)
+        self.btn_advanced.setMinimumHeight(34)
         settings_container.addWidget(self.btn_advanced)
 
         self.advanced_dialog = QDialog(self)
@@ -1530,7 +1648,7 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_record, "record", "#07260e", "successButton")
         self.btn_record.clicked.connect(self._on_record_clicked)
         self.btn_record.setEnabled(False)
-        self.btn_record.setMinimumHeight(50)
+        self.btn_record.setMinimumHeight(40)
         control_layout.addWidget(self.btn_record)
 
         control_group.setLayout(control_layout)
@@ -1587,11 +1705,16 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Signal Mapping")
         config_layout = QVBoxLayout()
         config_grid = QGridLayout()
+        config_grid.setHorizontalSpacing(6)
+        config_grid.setVerticalSpacing(6)
+        config_grid.setColumnStretch(1, 2)
+        config_grid.setColumnStretch(2, 1)
+        config_grid.setColumnStretch(3, 1)
         config_grid.addWidget(QLabel("Use"), 0, 0)
         config_grid.addWidget(QLabel("Label"), 0, 1)
         config_grid.addWidget(QLabel("Role"), 0, 2)
         config_grid.addWidget(QLabel("Pins"), 0, 3)
-        config_grid.addWidget(QLabel("Params"), 0, 4)
+        config_grid.addWidget(QLabel("Cfg"), 0, 4)
 
         default_roles = self._default_behavior_roles()
         for row, key in enumerate(self.DISPLAY_SIGNAL_ORDER, start=1):
@@ -1681,7 +1804,7 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_test_ttl, "pulse", "#33d5ff", "violetButton")
         self.btn_test_ttl.clicked.connect(self._on_test_ttl_clicked)
         self.btn_test_ttl.setEnabled(False)
-        self.btn_test_ttl.setMinimumHeight(42)
+        self.btn_test_ttl.setMinimumHeight(36)
         layout.addWidget(self.btn_test_ttl)
 
         layout.addStretch()
@@ -2247,6 +2370,7 @@ class MainWindow(QMainWindow):
         self.worker.buffer_update.connect(self._on_buffer_update)
         self.worker.error_occurred.connect(self._on_error_occurred)
         self.worker.recording_stopped.connect(self._on_recording_stopped)
+        self.worker.frame_drop_stats_updated.connect(self._on_frame_drop_stats_updated)
 
         # Connect frame recording to TTL sampling (sync TTLs with camera frames)
         self.worker.frame_recorded.connect(self._on_frame_recorded)
@@ -2860,7 +2984,7 @@ class MainWindow(QMainWindow):
         dialog_layout.addWidget(self.planner_panel_widget)
         self.planner_dialog.finished.connect(self._on_planner_dialog_finished)
         self.planner_detached = True
-        self.btn_planner_detach.setText("Reattach Planner")
+        self.btn_planner_detach.setText("Reattach")
         self._set_button_icon(self.btn_planner_detach, "import", "#6fe06e", "successButton")
         self.planner_dialog.show()
         self.planner_dialog.raise_()
@@ -2889,7 +3013,7 @@ class MainWindow(QMainWindow):
             self.planner_dialog.close()
             self.planner_dialog.deleteLater()
             self.planner_dialog = None
-        self.btn_planner_detach.setText("Detach Planner")
+        self.btn_planner_detach.setText("Detach")
         self._set_button_icon(self.btn_planner_detach, "export", "#ffb35d", "orangeButton")
         self.planner_reattaching = False
 
@@ -3162,6 +3286,100 @@ class MainWindow(QMainWindow):
         with open(metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=4)
 
+    def _frame_drop_reference_fps(self) -> float:
+        """Return the currently configured FPS reference for frame-drop display."""
+        if hasattr(self, "spin_fps") and self.spin_fps is not None:
+            try:
+                return float(self.spin_fps.value())
+            except Exception:
+                pass
+        return float(self.default_fps)
+
+    def _reset_frame_drop_display(self, recording_active: bool = False):
+        """Reset the compact frame-drop monitor for a new or idle session."""
+        self.frame_drop_events.clear()
+        self.last_frame_drop_log_signature = None
+        reference_fps = self._frame_drop_reference_fps()
+        state = "REC" if recording_active else "Standby"
+        self.last_frame_drop_stats = {
+            "active": recording_active,
+            "recorded_frames": 0,
+            "estimated_dropped_frames": 0,
+            "estimated_total_frames": 0,
+            "drop_percent": 0.0,
+            "reference_fps": reference_fps,
+            "average_interval_ms": 0.0,
+            "max_gap_ms": 0.0,
+            "last_interval_ms": 0.0,
+            "elapsed_seconds": 0.0,
+            "timestamp_source": "software",
+        }
+
+        if self.label_frame_drop_summary is not None:
+            summary_color = "#89f0b2" if recording_active else "#dce8f4"
+            self.label_frame_drop_summary.setStyleSheet(f"color: {summary_color}; font-weight: 700;")
+            self.label_frame_drop_summary.setText(
+                f"{state} | drop 0 (0.00%) | frames 0 | ref {reference_fps:.1f} fps"
+            )
+
+        if self.frame_drop_log is not None:
+            initial_line = (
+                "00:00:00 | monitoring armed"
+                if recording_active
+                else "Idle | stats are saved to *_metadata.txt after recording"
+            )
+            self.frame_drop_log.setPlainText(initial_line)
+
+    def _save_recording_text_metadata(self, base_path: str):
+        """Write a human-readable metadata summary with frame-drop statistics."""
+        metadata_txt_file = Path(f"{base_path}_metadata.txt")
+        metadata = dict(self.metadata) if self.metadata else self._collect_metadata()
+        stats = dict(self.last_frame_drop_stats)
+        if not stats and self.worker:
+            stats = dict(self.worker.last_recording_stats)
+
+        try:
+            lines = [
+                "CamApp Metadata Summary",
+                f"generated_at: {datetime.now().isoformat()}",
+                f"recording_base_path: {base_path}",
+                "",
+                "Session Metadata",
+            ]
+
+            for key, value in metadata.items():
+                value_text = "" if value is None else str(value)
+                value_lines = value_text.splitlines() or [""]
+                if len(value_lines) == 1:
+                    lines.append(f"{key}: {value_lines[0]}")
+                else:
+                    lines.append(f"{key}:")
+                    for value_line in value_lines:
+                        lines.append(f"  {value_line}")
+
+            lines.extend(
+                [
+                    "",
+                    "Frame Drop Statistics",
+                    f"reference_fps: {float(stats.get('reference_fps', 0.0)):.3f}",
+                    f"recorded_frames: {int(stats.get('recorded_frames', 0))}",
+                    f"estimated_dropped_frames: {int(stats.get('estimated_dropped_frames', 0))}",
+                    f"estimated_total_frames: {int(stats.get('estimated_total_frames', 0))}",
+                    f"drop_percent: {float(stats.get('drop_percent', 0.0)):.3f}",
+                    f"average_interval_ms: {float(stats.get('average_interval_ms', 0.0)):.3f}",
+                    f"max_gap_ms: {float(stats.get('max_gap_ms', 0.0)):.3f}",
+                    f"last_interval_ms: {float(stats.get('last_interval_ms', 0.0)):.3f}",
+                    f"timestamp_source: {stats.get('timestamp_source', 'software')}",
+                    "method: estimated from software timestamp gaps against the recording reference fps",
+                ]
+            )
+
+            with open(metadata_txt_file, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            self._on_status_update(f"Metadata text saved: {metadata_txt_file.name}")
+        except Exception as exc:
+            self._on_error_occurred(f"Metadata text save error: {exc}")
+
     # ===== Camera Control Slots =====
 
     @Slot()
@@ -3231,6 +3449,7 @@ class MainWindow(QMainWindow):
             badge_text="Offline",
             badge_tone="warning",
         )
+        self._reset_frame_drop_display()
         self.label_fps.setText("FPS: 0.0")
         self.label_buffer.setText("Buffer: 0%")
         self._update_advanced_controls_state()
@@ -3291,6 +3510,7 @@ class MainWindow(QMainWindow):
 
             self.worker.set_encoder(encoder)
             self.worker.set_recording_frame_limit(self._get_target_record_frames())
+            self._reset_frame_drop_display(recording_active=True)
 
             if self.is_arduino_connected:
                 self._apply_behavior_pin_configuration(persist=True)
@@ -3306,6 +3526,7 @@ class MainWindow(QMainWindow):
                     self._set_behavior_status("ARMED", "accent")
 
             if not self.worker.start_recording(filepath):
+                self._reset_frame_drop_display()
                 if self.is_arduino_connected:
                     self._stop_arduino_generation()
                 self._sync_active_trial_status("Pending")
@@ -3344,6 +3565,9 @@ class MainWindow(QMainWindow):
         self.recording_start_time = None
         self._update_live_header(badge_text="Preview" if self.is_camera_connected else "Offline",
                                  badge_tone="accent" if self.is_camera_connected else "warning")
+        filepath = self.current_recording_filepath
+        if not filepath and self.worker and self.worker.recording_filename:
+            filepath = self.worker.recording_filename
 
         # Re-enable controls
         self.btn_connect.setEnabled(True)
@@ -3351,10 +3575,12 @@ class MainWindow(QMainWindow):
         if self.is_arduino_connected:
             self.btn_test_ttl.setEnabled(True)
 
+        if filepath:
+            self._save_recording_text_metadata(filepath)
+
         if self.is_arduino_connected:
             self._stop_arduino_generation()
 
-            filepath = self.current_recording_filepath
             if not filepath:
                 save_folder = Path(self.edit_save_folder.text())
                 fallback_name = self.edit_filename.text().strip() or "recording"
@@ -3399,6 +3625,7 @@ class MainWindow(QMainWindow):
         stems = [
             f"{base_path}.mp4",
             f"{base_path}_metadata.json",
+            f"{base_path}_metadata.txt",
             f"{base_path}_ttl_states.csv",
             f"{base_path}_ttl_live_states.csv",
             f"{base_path}_ttl_events.csv",
@@ -4244,6 +4471,45 @@ class MainWindow(QMainWindow):
 
     # ===== Display Slots =====
 
+    @Slot(dict)
+    def _on_frame_drop_stats_updated(self, stats: dict):
+        """Refresh the compact frame-drop monitor from worker timing data."""
+        self.last_frame_drop_stats = dict(stats or {})
+        recorded_frames = int(self.last_frame_drop_stats.get("recorded_frames", 0))
+        dropped_frames = int(self.last_frame_drop_stats.get("estimated_dropped_frames", 0))
+        drop_percent = float(self.last_frame_drop_stats.get("drop_percent", 0.0))
+        reference_fps = float(self.last_frame_drop_stats.get("reference_fps", self._frame_drop_reference_fps()))
+        average_interval_ms = float(self.last_frame_drop_stats.get("average_interval_ms", 0.0))
+        max_gap_ms = float(self.last_frame_drop_stats.get("max_gap_ms", 0.0))
+        elapsed_seconds = int(round(float(self.last_frame_drop_stats.get("elapsed_seconds", 0.0))))
+        is_active = bool(self.last_frame_drop_stats.get("active", False))
+
+        if self.label_frame_drop_summary is not None:
+            if dropped_frames == 0:
+                summary_color = "#89f0b2"
+            elif drop_percent < 1.0:
+                summary_color = "#ffc86b"
+            else:
+                summary_color = "#ff98ae"
+            state = "REC" if is_active else "LAST"
+            self.label_frame_drop_summary.setStyleSheet(f"color: {summary_color}; font-weight: 700;")
+            self.label_frame_drop_summary.setText(
+                f"{state} | drop {dropped_frames} ({drop_percent:.2f}%) | frames {recorded_frames} | ref {reference_fps:.1f} fps"
+            )
+
+        log_signature = (recorded_frames, dropped_frames, round(drop_percent, 3), is_active)
+        if log_signature == self.last_frame_drop_log_signature:
+            return
+        self.last_frame_drop_log_signature = log_signature
+
+        log_line = (
+            f"{self._format_duration_hms(elapsed_seconds)} | {recorded_frames}f | "
+            f"drop {dropped_frames} ({drop_percent:.2f}%) | avg {average_interval_ms:.1f} ms | max {max_gap_ms:.1f} ms"
+        )
+        self.frame_drop_events.append(log_line)
+        if self.frame_drop_log is not None:
+            self.frame_drop_log.setPlainText("\n".join(self.frame_drop_events))
+
     def _update_live_header(
         self,
         status_text: Optional[str] = None,
@@ -4485,6 +4751,11 @@ class MainWindow(QMainWindow):
         """Handle error messages."""
         self.status_bar.showMessage(f"ERROR: {error_message}", 10000)
         print(f"Error: {error_message}")
+
+    def resizeEvent(self, event):
+        """Keep shell widths responsive as the main window changes size."""
+        self._update_side_panel_bounds()
+        super().resizeEvent(event)
 
     def closeEvent(self, event):
         """Handle window close event - cleanup resources."""

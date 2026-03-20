@@ -1,1 +1,16 @@
 __pycache__/
+build/camApp/Analysis-00.toc
+build/camApp/base_library.zip
+build/camApp/CamApp.pkg
+build/camApp/EXE-00.toc
+build/camApp/PKG-00.toc
+build/camApp/PYZ-00.pyz
+build/camApp/PYZ-00.toc
+build/camApp/warn-camApp.txt
+build/camApp/xref-camApp.html
+build/camApp/localpycs/pyimod01_archive.pyc
+build/camApp/localpycs/pyimod02_importers.pyc
+build/camApp/localpycs/pyimod03_ctypes.pyc
+build/camApp/localpycs/pyimod04_pywin32.pyc
+build/camApp/localpycs/struct.pyc
+dist/CamApp.exe
