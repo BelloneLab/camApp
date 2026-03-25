@@ -21,6 +21,7 @@ from collections import deque
 import json
 from pathlib import Path
 import os
+import re
 from pypylon import pylon
 import cv2
 from typing import Optional, Dict, List
@@ -1896,6 +1897,159 @@ class MainWindow(QMainWindow):
     def _state_key_for_display(self, key: str) -> str:
         return str(self.DISPLAY_SIGNAL_META.get(key, {}).get("state_key", key))
 
+    def _display_signal_key_for_worker_signal(self, key: str) -> str:
+        """Map worker/raw signal names back to one display signal key."""
+        signal_key = str(key).strip().lower()
+        if signal_key in ("barcode0", "barcode1"):
+            return "barcode"
+        if signal_key in self.DISPLAY_SIGNAL_META:
+            return signal_key
+        for display_key in self.DISPLAY_SIGNAL_ORDER:
+            if self._state_key_for_display(display_key) == signal_key:
+                return display_key
+        return signal_key
+
+    def _slugify_export_label(self, label: str, fallback: str) -> str:
+        """Convert one user label into a stable CSV-safe column fragment."""
+        cleaned = re.sub(r"[^0-9A-Za-z]+", "_", str(label).strip().lower()).strip("_")
+        return cleaned or str(fallback).strip().lower() or "signal"
+
+    def _signal_export_definitions(self) -> Dict[str, Dict[str, str]]:
+        """Build unique export column definitions from current user labels."""
+        role_map = self._current_behavior_roles() if self.behavior_role_boxes else self._default_behavior_roles()
+        pin_map = self._current_behavior_pin_map() if self.behavior_pin_edits else self._default_behavior_pin_map()
+        definitions: Dict[str, Dict[str, str]] = {}
+        used_slugs: set[str] = set()
+
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            label = self._signal_label(key).strip() or str(self.DISPLAY_SIGNAL_META[key]["name"])
+            base_slug = self._slugify_export_label(label, key)
+            slug = base_slug
+            index = 2
+            while slug in used_slugs:
+                slug = f"{base_slug}_{index}"
+                index += 1
+            used_slugs.add(slug)
+            definitions[key] = {
+                "key": key,
+                "state_key": self._state_key_for_display(key),
+                "label": label,
+                "slug": slug,
+                "state_column": slug,
+                "count_column": f"{slug}_count",
+                "role": str(role_map.get(key, self.DISPLAY_SIGNAL_META[key]["role"])),
+                "pins": self._format_pin_list(pin_map.get(key, [])),
+            }
+
+        return definitions
+
+    def _coerce_binary_series(self, df, candidates: List[str]):
+        """Return the first matching column coerced to a clean binary series."""
+        import pandas as pd
+
+        for column in candidates:
+            if column in df.columns:
+                return pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int).clip(0, 1)
+        return pd.Series(np.zeros(len(df), dtype=int), index=df.index)
+
+    def _resolve_display_signal_series(self, df, key: str):
+        """Resolve one logical signal into a binary series from raw export columns."""
+        definitions = self._signal_export_definitions()
+        state_column = definitions.get(key, {}).get("state_column", "")
+
+        if key == "barcode":
+            barcode_aggregate = self._coerce_binary_series(
+                df,
+                [state_column, "barcode_state", "barcode_ttl", "barcode"],
+            )
+            barcode_pin0 = self._coerce_binary_series(df, ["barcode0_state", "barcode_pin0_ttl", "barcode0"])
+            barcode_pin1 = self._coerce_binary_series(df, ["barcode1_state", "barcode_pin1_ttl", "barcode1"])
+            return (barcode_aggregate | barcode_pin0 | barcode_pin1).astype(int)
+
+        candidates = {
+            "gate": [state_column, "gate_state", "gate_ttl", "gate"],
+            "sync": [state_column, "sync_state", "sync_1hz_ttl", "sync_10hz_ttl", "sync"],
+            "lever": [state_column, "lever_state", "lever_ttl", "lever"],
+            "cue": [state_column, "cue_state", "cue_ttl", "cue"],
+            "reward": [state_column, "reward_state", "reward_ttl", "reward"],
+            "iti": [state_column, "iti_state", "iti_ttl", "iti"],
+        }
+        return self._coerce_binary_series(df, candidates.get(key, [state_column, f"{key}_state", key]))
+
+    def _resolve_display_signal_count(self, key: str, ttl_counts: Dict) -> int:
+        """Resolve one logical signal count from the worker pulse-count payload."""
+        if key == "barcode":
+            return max(int(ttl_counts.get("barcode0", 0)), int(ttl_counts.get("barcode1", 0)))
+        state_key = self._state_key_for_display(key)
+        return int(ttl_counts.get(state_key, 0))
+
+    def _resolve_display_signal_count_series(self, df, key: str):
+        """Resolve one logical signal count series from exported sample columns."""
+        import pandas as pd
+
+        definitions = self._signal_export_definitions()
+        preferred = definitions.get(key, {}).get("count_column", "")
+        if key == "barcode":
+            candidates = [preferred, "barcode_count"]
+        else:
+            state_key = self._state_key_for_display(key)
+            candidates = [preferred, f"{key}_count", f"{state_key}_count"]
+
+        for column in candidates:
+            if column in df.columns:
+                return pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int)
+        return None
+
+    def _reorder_signal_export_columns(self, df):
+        """Move label-driven signal columns forward in exported CSV files."""
+        if df is None or df.empty:
+            return df
+
+        definitions = self._signal_export_definitions()
+        preferred: List[str] = []
+        metadata_columns = [
+            "frame_id",
+            "timestamp_camera",
+            "timestamp_software",
+            "timestamp_arduino_ms",
+            "exposure_time_us",
+            "passive_mode",
+            "signal",
+            "signal_key",
+            "signal_label",
+            "signal_role",
+            "signal_pins",
+            "state_column",
+            "count_column",
+            "edge",
+            "state",
+            "count",
+        ]
+        for column in metadata_columns:
+            if column in df.columns and column not in preferred:
+                preferred.append(column)
+
+        for line in range(1, 5):
+            for column in (f"line{line}_status",):
+                if column in df.columns and column not in preferred:
+                    preferred.append(column)
+            for column in df.columns:
+                if column.startswith(f"line{line}_status_") and column not in preferred:
+                    preferred.append(column)
+
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            spec = definitions.get(key, {})
+            for column in (spec.get("state_column"), spec.get("count_column"), f"{key}_state"):
+                if column and column in df.columns and column not in preferred:
+                    preferred.append(column)
+
+        for column in ("ttl_state", "behavior_state", "ttl_state_vector", "behavior_state_vector"):
+            if column in df.columns and column not in preferred:
+                preferred.append(column)
+
+        remaining = [column for column in df.columns if column not in preferred]
+        return df[preferred + remaining]
+
     def _active_signal_keys(self, group: Optional[str] = None) -> List[str]:
         active = []
         for key in self.DISPLAY_SIGNAL_ORDER:
@@ -2176,6 +2330,7 @@ class MainWindow(QMainWindow):
             for key in self.DISPLAY_SIGNAL_ORDER:
                 self.settings.setValue(f"behavior_signal_label_{key}", self._signal_label(key))
                 self.settings.setValue(f"behavior_signal_enabled_{key}", int(bool(self.signal_display_config[key]["enabled"])))
+            self.settings.sync()
 
         if self.arduino_worker:
             self.arduino_worker.set_manual_pin_config(pin_map)
@@ -3627,8 +3782,6 @@ class MainWindow(QMainWindow):
             f"{base_path}_metadata.json",
             f"{base_path}_metadata.txt",
             f"{base_path}_ttl_states.csv",
-            f"{base_path}_ttl_live_states.csv",
-            f"{base_path}_ttl_events.csv",
             f"{base_path}_ttl_counts.csv",
             f"{base_path}_behavior_summary.csv",
         ]
@@ -4301,70 +4454,70 @@ class MainWindow(QMainWindow):
 
     def _augment_ttl_state_columns(self, df):
         """Add aggregate TTL/behavior state columns for CSV readability."""
-        import pandas as pd
-
         if df is None or df.empty:
             return df
 
         df = df.copy()
-        mapping = {
-            "gate": ["gate_ttl", "gate"],
-            "sync": ["sync_1hz_ttl", "sync"],
-            "barcode0": ["barcode_pin0_ttl", "barcode0"],
-            "barcode1": ["barcode_pin1_ttl", "barcode1"],
-            "lever": ["lever_ttl", "lever"],
-            "cue": ["cue_ttl", "cue"],
-            "reward": ["reward_ttl", "reward"],
-            "iti": ["iti_ttl", "iti"],
+        definitions = self._signal_export_definitions()
+        resolved = {
+            key: self._resolve_display_signal_series(df, key)
+            for key in self.DISPLAY_SIGNAL_ORDER
         }
 
-        resolved = {}
-        for key, candidates in mapping.items():
-            series = None
-            for col in candidates:
-                if col in df.columns:
-                    series = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).clip(0, 1)
-                    break
-            if series is None:
-                series = pd.Series(np.zeros(len(df), dtype=int), index=df.index)
-            resolved[key] = series
-            col_name = f"{key}_state"
-            if col_name not in df.columns:
-                df[col_name] = series
+        for key, series in resolved.items():
+            logical_column = f"{key}_state"
+            if logical_column not in df.columns:
+                df[logical_column] = series
+            labeled_column = definitions[key]["state_column"]
+            if labeled_column not in df.columns:
+                df[labeled_column] = series
 
-        barcode_state = (resolved["barcode0"] | resolved["barcode1"]).astype(int)
-        ttl_active = (resolved["gate"] | resolved["sync"] | barcode_state).astype(int)
+            count_series = self._resolve_display_signal_count_series(df, key)
+            labeled_count_column = definitions[key]["count_column"]
+            if count_series is not None and labeled_count_column not in df.columns:
+                df[labeled_count_column] = count_series
+
+        ttl_active = (resolved["gate"] | resolved["sync"] | resolved["barcode"]).astype(int)
         behavior_active = (resolved["lever"] | resolved["cue"] | resolved["reward"] | resolved["iti"]).astype(int)
 
         df["ttl_state"] = np.where(ttl_active > 0, "HIGH", "LOW")
         df["behavior_state"] = np.where(behavior_active > 0, "ACTIVE", "IDLE")
+        ttl_labels = {key: definitions[key]["label"] for key in ("gate", "sync", "barcode")}
+        behavior_labels = {key: definitions[key]["label"] for key in ("lever", "cue", "reward", "iti")}
         df["ttl_state_vector"] = (
-            "gate=" + resolved["gate"].astype(str)
-            + "|sync=" + resolved["sync"].astype(str)
-            + "|barcode=" + barcode_state.astype(str)
+            f"{ttl_labels['gate']}=" + resolved["gate"].astype(str)
+            + f"|{ttl_labels['sync']}=" + resolved["sync"].astype(str)
+            + f"|{ttl_labels['barcode']}=" + resolved["barcode"].astype(str)
         )
         df["behavior_state_vector"] = (
-            "lever=" + resolved["lever"].astype(str)
-            + "|cue=" + resolved["cue"].astype(str)
-            + "|reward=" + resolved["reward"].astype(str)
-            + "|iti=" + resolved["iti"].astype(str)
+            f"{behavior_labels['lever']}=" + resolved["lever"].astype(str)
+            + f"|{behavior_labels['cue']}=" + resolved["cue"].astype(str)
+            + f"|{behavior_labels['reward']}=" + resolved["reward"].astype(str)
+            + f"|{behavior_labels['iti']}=" + resolved["iti"].astype(str)
         )
 
-        return df
+        return self._reorder_signal_export_columns(df)
 
     def _build_behavior_summary_df(self, source_df, ttl_counts: Dict) -> "pd.DataFrame":
         """Build behavior summary (counts and cumulative HIGH durations)."""
         import pandas as pd
 
         signals = ["lever", "cue", "reward", "iti"]
+        definitions = self._signal_export_definitions()
         rows = []
 
         if source_df is None or source_df.empty or "timestamp_software" not in source_df.columns:
             for signal in signals:
+                definition = definitions.get(signal, {})
                 rows.append(
                     {
-                        "signal": signal,
-                        "count": int(ttl_counts.get(signal, 0)),
+                        "signal": definition.get("label", signal),
+                        "signal_key": signal,
+                        "signal_role": definition.get("role", self.DISPLAY_SIGNAL_META[signal]["role"]),
+                        "signal_pins": definition.get("pins", "-"),
+                        "state_column": definition.get("state_column", signal),
+                        "count_column": definition.get("count_column", f"{signal}_count"),
+                        "count": self._resolve_display_signal_count(signal, ttl_counts),
                         "cumulative_duration_s": 0.0,
                         "duty_cycle_pct": 0.0,
                         "last_state": "LOW",
@@ -4386,21 +4539,23 @@ class MainWindow(QMainWindow):
             total_duration = 0.0
 
         for signal in signals:
-            if signal in df.columns:
-                state = pd.to_numeric(df[signal], errors="coerce").fillna(0).astype(int).clip(0, 1)
-            elif f"{signal}_ttl" in df.columns:
-                state = pd.to_numeric(df[f"{signal}_ttl"], errors="coerce").fillna(0).astype(int).clip(0, 1)
-            else:
-                state = pd.Series(np.zeros(len(df), dtype=int), index=df.index)
-
+            definition = definitions.get(signal, {})
+            state = self._resolve_display_signal_series(df, signal)
             rises = int(((state == 1) & (state.shift(1, fill_value=0) == 0)).sum())
             duration_high = float((dt * state).sum())
             duty_cycle = (100.0 * duration_high / total_duration) if total_duration > 0 else 0.0
-            count_value = int(ttl_counts.get(signal, rises))
+            count_value = self._resolve_display_signal_count(signal, ttl_counts)
+            if count_value <= 0:
+                count_value = rises
 
             rows.append(
                 {
-                    "signal": signal,
+                    "signal": definition.get("label", signal),
+                    "signal_key": signal,
+                    "signal_role": definition.get("role", self.DISPLAY_SIGNAL_META[signal]["role"]),
+                    "signal_pins": definition.get("pins", "-"),
+                    "state_column": definition.get("state_column", signal),
+                    "count_column": definition.get("count_column", f"{signal}_count"),
                     "count": count_value,
                     "cumulative_duration_s": round(duration_high, 4),
                     "duty_cycle_pct": round(duty_cycle, 2),
@@ -4416,8 +4571,6 @@ class MainWindow(QMainWindow):
 
         Files produced (when data is available):
         - *_ttl_states.csv: frame-synced samples (during recording)
-        - *_ttl_live_states.csv: live monitor samples from worker thread
-        - *_ttl_events.csv: edge events detected by worker
         - *_ttl_counts.csv: final pulse counters
         - *_behavior_summary.csv: count + cumulative HIGH duration summary
         """
@@ -4425,6 +4578,7 @@ class MainWindow(QMainWindow):
             import pandas as pd
 
             ttl_counts = self.arduino_worker.get_ttl_pulse_counts() or {}
+            export_definitions = self._signal_export_definitions()
             df_history = None
             df_live = None
 
@@ -4441,24 +4595,18 @@ class MainWindow(QMainWindow):
             if live_history:
                 df_live = pd.DataFrame(live_history)
                 df_live = self._augment_ttl_state_columns(df_live)
-                csv_file = filepath + "_ttl_live_states.csv"
-                df_live.to_csv(csv_file, index=False)
-                self._on_status_update(f"TTL live states saved: {csv_file}")
-
-            ttl_events = self.arduino_worker.get_ttl_event_history()
-            if ttl_events:
-                df = pd.DataFrame(ttl_events)
-                csv_file = filepath + "_ttl_events.csv"
-                df.to_csv(csv_file, index=False)
-                self._on_status_update(f"TTL events saved: {csv_file}")
 
             if ttl_counts:
-                df = pd.DataFrame([ttl_counts])
+                count_row = dict(ttl_counts)
+                for key, definition in export_definitions.items():
+                    count_row[definition["count_column"]] = self._resolve_display_signal_count(key, ttl_counts)
+                df = pd.DataFrame([count_row])
+                df = self._reorder_signal_export_columns(df)
                 csv_file = filepath + "_ttl_counts.csv"
                 df.to_csv(csv_file, index=False)
                 self._on_status_update(f"TTL counts saved: {csv_file}")
 
-            summary_source = df_live if df_live is not None else df_history
+            summary_source = df_history if df_history is not None else df_live
             if summary_source is not None:
                 behavior_summary = self._build_behavior_summary_df(summary_source, ttl_counts)
                 csv_file = filepath + "_behavior_summary.csv"
@@ -4759,6 +4907,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event - cleanup resources."""
+        try:
+            self._apply_behavior_pin_configuration(persist=True)
+        except Exception:
+            pass
+
         if self.is_camera_connected:
             self._disconnect_camera()
 

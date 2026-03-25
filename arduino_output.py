@@ -236,6 +236,7 @@ class ArduinoOutputWorker(QThread):
         self.settings.setValue("barcode_start_low_s", float(self.BARCODE_START_LOW_S))
         self.settings.setValue("barcode_bit_s", float(self.BARCODE_BIT_S))
         self.settings.setValue("barcode_interval_s", float(self.BARCODE_INTERVAL_S))
+        self.settings.sync()
 
     def set_manual_pin_config(self, pin_config: Dict[str, List[int]]):
         """Apply manual pin mapping from GUI configuration."""

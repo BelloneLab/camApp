@@ -1,0 +1,5 @@
+signal,signal_key,signal_role,signal_pins,state_column,count_column,count,cumulative_duration_s,duty_cycle_pct,last_state
+Lever Press,lever,Input,14,lever_press,lever_press_count,1,0.033,24.81,LOW
+Cue LED,cue,Output,45,cue_led,cue_led_count,1,0.033,24.81,LOW
+Reward Valve,reward,Output,21,reward_valve,reward_valve_count,1,0.033,24.81,LOW
+ITI Light,iti,Output,46,iti_light,iti_light_count,1,0.0,0.0,HIGH
