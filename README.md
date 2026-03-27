@@ -121,25 +121,36 @@ Barcode timing notes:
 
 ## Build CamApp.exe
 
-Install build tool:
+CamApp ships with a checked-in PyInstaller spec at `camApp.spec` plus a reusable build script at `scripts/build_release.ps1`.
+
+Local build from the `CamApp` Python environment:
 
 ```powershell
-pip install pyinstaller
+python -m pip install -r requirements.txt pyinstaller
+.\scripts\build_release.ps1 -Version dev -PythonExe python -Clean
 ```
 
-Build a single-file EXE:
+That produces:
 
-```powershell
-pyinstaller --onefile --noconsole --name CamApp main.py
-```
+- `dist/CamApp.exe`
+- `release/CamApp-dev-windows-x64.zip`
+- `release/CamApp-dev-windows-x64.sha256`
+- `release/CamApp-dev-windows-x64-warn.txt`
 
-The output will be in `dist/CamApp.exe`. Copy it to the project root if desired:
+Note: the compiled EXE still requires FFmpeg available on PATH at runtime. FLIR Spinnaker support also still requires the vendor SDK and `PySpin` on the target machine; the GitHub build does not bundle the Spinnaker SDK.
 
-```powershell
-copy dist\CamApp.exe .\
-```
+## GitHub Release Workflow
 
-Note: The compiled EXE still requires FFmpeg available on PATH at runtime.
+There is a manual GitHub Actions workflow at `.github/workflows/release-windows.yml`.
+
+Use `Actions > Build And Release CamApp > Run workflow` and provide:
+
+- `tag`: release tag such as `v1.0.0`
+- `release_name`: optional display title
+- `prerelease`: mark the GitHub release as prerelease
+- `draft`: publish as draft instead of a public release
+
+The workflow builds the Windows EXE on `windows-latest`, zips it, generates a SHA-256 checksum, uploads the build artifacts, and then publishes a GitHub release with those assets attached.
 
 ## Troubleshooting
 

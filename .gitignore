@@ -14,6 +14,7 @@ build/camApp/localpycs/pyimod03_ctypes.pyc
 build/camApp/localpycs/pyimod04_pywin32.pyc
 build/camApp/localpycs/struct.pyc
 dist/CamApp.exe
+release/
 PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/docs/FLIR Camera Getting Started.html
 .gitignore
 PySpin/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64/licenses/Spinnaker-Open-Source-Licenses.pdf

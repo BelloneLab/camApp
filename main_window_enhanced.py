@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QAbstractItemView, QMessageBox, QSizePolicy)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF
 from PySide6.QtGui import (QAction, QIcon, QPixmap, QPainter, QColor, QPen,
-                           QBrush, QPainterPath, QLinearGradient)
+                           QBrush, QPainterPath, QLinearGradient, QShortcut,
+                           QKeySequence)
 import numpy as np
 from datetime import datetime
 import pyqtgraph as pg
@@ -100,6 +101,9 @@ class MainWindow(QMainWindow):
         self.current_recording_filepath = None
         self.recording_timer = QTimer()
         self.recording_timer.timeout.connect(self._update_recording_time)
+        self.space_record_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
+        self.space_record_shortcut.setContext(Qt.WindowShortcut)
+        self.space_record_shortcut.activated.connect(self._on_space_record_shortcut)
 
         # ROI state
         self.roi_rect = None
@@ -139,6 +143,8 @@ class MainWindow(QMainWindow):
         self.live_header_mode: Optional[QLabel] = None
         self.live_header_roi: Optional[QLabel] = None
         self.live_status_badge: Optional[QLabel] = None
+        self.active_camera_pixel_format_node = ""
+        self.active_camera_bit_depth_node = ""
         self.label_ttl_status: Optional[QLabel] = None
         self.label_behavior_status: Optional[QLabel] = None
         self.label_frame_drop_summary: Optional[QLabel] = None
@@ -1785,6 +1791,14 @@ class MainWindow(QMainWindow):
         self.spin_contrast = QDoubleSpinBox()
         self.spin_contrast.valueChanged.connect(self._on_contrast_changed)
         advanced_layout.addRow("Contrast:", self.spin_contrast)
+
+        self.combo_camera_pixel_format = QComboBox()
+        self.combo_camera_pixel_format.currentTextChanged.connect(self._on_camera_pixel_format_changed)
+        advanced_layout.addRow("Pixel Format:", self.combo_camera_pixel_format)
+
+        self.combo_camera_bit_depth = QComboBox()
+        self.combo_camera_bit_depth.currentTextChanged.connect(self._on_camera_bit_depth_changed)
+        advanced_layout.addRow("Bit Depth:", self.combo_camera_bit_depth)
 
         roi_button_layout = QHBoxLayout()
         self.btn_draw_roi = QPushButton("Draw ROI")
@@ -4860,6 +4874,35 @@ class MainWindow(QMainWindow):
             if self.is_arduino_connected:
                 self._stop_arduino_generation()
 
+    def _focused_widget_blocks_space_record(self) -> bool:
+        """Return True when space should remain with the currently focused editor."""
+        widget = self.focusWidget()
+        if widget is None:
+            return False
+        return isinstance(
+            widget,
+            (
+                QLineEdit,
+                QTextEdit,
+                QSpinBox,
+                QDoubleSpinBox,
+                QComboBox,
+                QTableWidget,
+            ),
+        )
+
+    @Slot()
+    def _on_space_record_shortcut(self):
+        """Start recording from the keyboard without stealing spaces from editors."""
+        if self._focused_widget_blocks_space_record():
+            return
+        if not self.is_camera_connected or self.worker is None:
+            return
+        if self.worker.is_recording:
+            return
+        if self.btn_record is not None and self.btn_record.isEnabled():
+            self._on_record_clicked()
+
     @Slot()
     def _on_recording_stopped(self):
         """Handle recording stopped signal."""
@@ -5182,6 +5225,7 @@ class MainWindow(QMainWindow):
     def _update_advanced_controls_state(self):
         """Update advanced controls based on camera availability."""
         if not self.worker or not self.worker.is_genicam_camera():
+            self._refresh_camera_native_format_controls()
             self._set_advanced_controls_enabled(False)
             return
 
@@ -5196,6 +5240,7 @@ class MainWindow(QMainWindow):
             self._configure_float_node("BlackLevel", self.spin_brightness)
         if not self._configure_float_node("Contrast", self.spin_contrast):
             self._configure_float_node("Gamma", self.spin_contrast)
+        self._refresh_camera_native_format_controls(apply_saved=True)
 
         if self.spin_offset_x.isEnabled() and self.spin_offset_y.isEnabled():
             if self.settings.contains('offset_x') and self.settings.contains('offset_y'):
@@ -5252,8 +5297,148 @@ class MainWindow(QMainWindow):
             self.spin_white_balance_blue,
             self.spin_brightness,
             self.spin_contrast,
+            self.combo_camera_pixel_format,
+            self.combo_camera_bit_depth,
         ):
             widget.setEnabled(enabled)
+
+    def _refresh_camera_native_format_controls(self, apply_saved: bool = False):
+        """Populate advanced camera-native pixel-format and bit-depth controls."""
+        if not self.worker or not self.worker.is_genicam_camera():
+            self.active_camera_pixel_format_node = ""
+            self.active_camera_bit_depth_node = ""
+            for combo, placeholder in (
+                (self.combo_camera_pixel_format, "Unavailable"),
+                (self.combo_camera_bit_depth, "Unavailable"),
+            ):
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem(placeholder)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+                combo.setEnabled(False)
+                combo.setToolTip("")
+            return
+
+        pixel_info = self.worker.get_camera_pixel_format_options()
+        self.active_camera_pixel_format_node = str(pixel_info.get("node_name", "") or "")
+        if apply_saved:
+            saved_pixel_format = str(self.settings.value("camera_native_pixel_format", "") or "").strip()
+            pixel_options = [str(value).strip() for value in pixel_info.get("options", []) if str(value).strip()]
+            current_pixel_format = str(pixel_info.get("current", "") or "").strip()
+            if (
+                saved_pixel_format
+                and saved_pixel_format in pixel_options
+                and saved_pixel_format != current_pixel_format
+                and bool(pixel_info.get("writable", False))
+            ):
+                applied = self.worker.set_camera_pixel_format(saved_pixel_format)
+                if applied is not None:
+                    pixel_info = self.worker.get_camera_pixel_format_options()
+                    self.active_camera_pixel_format_node = str(pixel_info.get("node_name", "") or "")
+        self._configure_camera_enum_combo(
+            combo=self.combo_camera_pixel_format,
+            info=pixel_info,
+            settings_key="camera_native_pixel_format",
+            tooltip_prefix="Native camera pixel format",
+            apply_saved=apply_saved,
+        )
+
+        bit_depth_info = self.worker.get_camera_bit_depth_options()
+        self.active_camera_bit_depth_node = str(bit_depth_info.get("node_name", "") or "")
+        if apply_saved:
+            saved_bit_depth = str(self.settings.value("camera_native_bit_depth", "") or "").strip()
+            depth_options = [str(value).strip() for value in bit_depth_info.get("options", []) if str(value).strip()]
+            current_bit_depth = str(bit_depth_info.get("current", "") or "").strip()
+            if (
+                saved_bit_depth
+                and saved_bit_depth in depth_options
+                and saved_bit_depth != current_bit_depth
+                and bool(bit_depth_info.get("writable", False))
+            ):
+                applied = self.worker.set_camera_bit_depth(saved_bit_depth)
+                if applied is not None:
+                    bit_depth_info = self.worker.get_camera_bit_depth_options()
+                    self.active_camera_bit_depth_node = str(bit_depth_info.get("node_name", "") or "")
+        tooltip_prefix = "Camera bit depth"
+        if self.active_camera_bit_depth_node:
+            tooltip_prefix = f"Camera bit depth ({self.active_camera_bit_depth_node})"
+        self._configure_camera_enum_combo(
+            combo=self.combo_camera_bit_depth,
+            info=bit_depth_info,
+            settings_key="camera_native_bit_depth",
+            tooltip_prefix=tooltip_prefix,
+            apply_saved=apply_saved,
+        )
+
+    def _configure_camera_enum_combo(
+        self,
+        combo: QComboBox,
+        info: Dict[str, object],
+        settings_key: str,
+        tooltip_prefix: str,
+        apply_saved: bool = False,
+    ):
+        """Fill one advanced combo from worker-reported enum capabilities."""
+        options = [str(value).strip() for value in info.get("options", []) if str(value).strip()]
+        current = str(info.get("current", "") or "").strip()
+        writable = bool(info.get("writable", False))
+        node_name = str(info.get("node_name", "") or "").strip()
+
+        combo.blockSignals(True)
+        combo.clear()
+        if options:
+            combo.addItems(options)
+            target_value = current if current in options else options[0]
+            if apply_saved:
+                saved_value = str(self.settings.value(settings_key, "") or "").strip()
+                if saved_value and saved_value in options:
+                    target_value = saved_value
+            combo.setCurrentText(target_value)
+        else:
+            combo.addItem("Unavailable")
+            combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+        combo.setEnabled(bool(options) and writable)
+        combo.setToolTip(f"{tooltip_prefix}: {node_name}" if node_name else tooltip_prefix)
+
+    def _on_camera_pixel_format_changed(self, pixel_format: str):
+        """Apply a camera-native pixel format from the advanced dialog."""
+        pixel_format = str(pixel_format or "").strip()
+        if not pixel_format or pixel_format == "Unavailable":
+            return
+        if not self.worker or not self.worker.is_genicam_camera():
+            return
+
+        applied = self.worker.set_camera_pixel_format(pixel_format)
+        if applied is None:
+            self._on_error_occurred("Failed to set native pixel format")
+            self._refresh_camera_native_format_controls(apply_saved=False)
+            return
+
+        self._save_ui_setting("camera_native_pixel_format", applied)
+        self._refresh_camera_native_format_controls(apply_saved=False)
+        self._update_live_header(mode_text=self.combo_image_format.currentText())
+        self._on_status_update(f"Camera pixel format: {applied}")
+
+    def _on_camera_bit_depth_changed(self, bit_depth: str):
+        """Apply a camera-native bit depth from the advanced dialog."""
+        bit_depth = str(bit_depth or "").strip()
+        if not bit_depth or bit_depth == "Unavailable":
+            return
+        if not self.worker or not self.worker.is_genicam_camera():
+            return
+
+        applied = self.worker.set_camera_bit_depth(bit_depth)
+        if applied is None:
+            self._on_error_occurred("Failed to set camera bit depth")
+            self._refresh_camera_native_format_controls(apply_saved=False)
+            return
+
+        self._save_ui_setting("camera_native_bit_depth", applied)
+        self._refresh_camera_native_format_controls(apply_saved=False)
+        self._on_status_update(f"Camera bit depth: {applied}")
 
     def _configure_white_balance_controls(self):
         """Populate white-balance controls when the camera exposes them."""

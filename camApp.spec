@@ -15,6 +15,7 @@ needed_dlls = (
     "ffi-7.dll",
     "libffi-8.dll",
     "libffi-7.dll",
+    "libexpat.dll",
     "libbz2.dll",
     "liblzma.dll",
     "sqlite3.dll",

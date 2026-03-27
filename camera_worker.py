@@ -291,9 +291,9 @@ class CameraWorker(QThread):
             if self.isRunning():
                 paused_for_reconfigure = self._pause_spinnaker_acquisition_for_reconfigure()
             try:
-                if image_format == "Mono8":
-                    self._set_enum_node_by_name("PixelFormat", "Mono8")
-                elif image_format == "BGR8":
+                current_pixel_format = self._read_enum_node_symbolic("PixelFormat")
+                current_is_color = self._is_color_pixel_format(current_pixel_format)
+                if image_format == "BGR8" and self.spinnaker_is_color and not current_is_color:
                     # Keep color cameras in their native Bayer/RGB format and
                     # debayer on the host when needed. This is more reliable than
                     # assuming the camera can switch directly to RGB8.
@@ -619,6 +619,141 @@ class CameraWorker(QThread):
                 entries.append(symbolic)
 
         return entries
+
+    def _select_enum_node_info(self, candidate_names: List[str]) -> Tuple[str, List[str], bool]:
+        """Return the best enum node match from a list of candidate node names."""
+        fallback_name = ""
+        fallback_entries: List[str] = []
+        fallback_writable = False
+
+        for node_name in candidate_names:
+            entries = self._list_enum_node_entries(node_name)
+            if not entries:
+                continue
+            node = self._get_camera_node(node_name)
+            writable = bool(node is not None and self._node_is_writable(node))
+            if writable:
+                return str(node_name), entries, True
+            if not fallback_name:
+                fallback_name = str(node_name)
+                fallback_entries = list(entries)
+                fallback_writable = writable
+
+        return fallback_name, fallback_entries, fallback_writable
+
+    def _is_supported_processing_pixel_format(self, pixel_format: str) -> bool:
+        """Return True when the app can safely preview and record this raw camera format."""
+        normalized = str(pixel_format or "").strip()
+        if not normalized:
+            return False
+        return normalized.startswith(("Mono", "Bayer", "RGB", "BGR"))
+
+    def _is_color_pixel_format(self, pixel_format: str) -> bool:
+        """Return True for raw pixel formats that carry color information."""
+        normalized = str(pixel_format or "").strip()
+        return normalized.startswith(("Bayer", "RGB", "BGR"))
+
+    def _get_camera_pixel_format_info(self) -> Dict[str, object]:
+        """Describe the active camera's native pixel-format control."""
+        if not self.is_genicam_camera():
+            return {"node_name": "PixelFormat", "options": [], "current": "", "writable": False}
+
+        options = [
+            entry
+            for entry in self._list_enum_node_entries("PixelFormat")
+            if self._is_supported_processing_pixel_format(entry)
+        ]
+        current = self._read_enum_node_symbolic("PixelFormat")
+        if current and current not in options and self._is_supported_processing_pixel_format(current):
+            options.insert(0, current)
+
+        node = self._get_camera_node("PixelFormat")
+        writable = bool(node is not None and self._node_is_writable(node))
+        return {
+            "node_name": "PixelFormat",
+            "options": options,
+            "current": current,
+            "writable": writable,
+        }
+
+    def _get_camera_bit_depth_info(self) -> Dict[str, object]:
+        """Describe the active camera's bit-depth / ADC control when available."""
+        if not self.is_genicam_camera():
+            return {"node_name": "", "options": [], "current": "", "writable": False}
+
+        node_name, options, writable = self._select_enum_node_info(
+            ["AdcBitDepth", "TransferBitDepth", "SensorBitDepth", "BitDepth", "PixelSize"]
+        )
+        current = self._read_enum_node_symbolic(node_name) if node_name else ""
+        if current and current not in options:
+            options = [current] + list(options)
+        return {
+            "node_name": node_name,
+            "options": options,
+            "current": current,
+            "writable": writable,
+        }
+
+    def get_camera_pixel_format_options(self) -> Dict[str, object]:
+        """Expose camera-native pixel-format options for the advanced UI."""
+        return self._get_camera_pixel_format_info()
+
+    def get_camera_bit_depth_options(self) -> Dict[str, object]:
+        """Expose camera-native bit-depth options for the advanced UI."""
+        return self._get_camera_bit_depth_info()
+
+    def set_camera_pixel_format(self, pixel_format: str) -> Optional[str]:
+        """Set the active camera's native pixel format when supported."""
+        pixel_format = str(pixel_format or "").strip()
+        if not self.is_genicam_camera() or not pixel_format:
+            return None
+
+        info = self._get_camera_pixel_format_info()
+        if pixel_format not in info.get("options", []):
+            return None
+
+        paused_for_reconfigure = False
+        if self.is_spinnaker_camera() and self.isRunning():
+            paused_for_reconfigure = self._pause_spinnaker_acquisition_for_reconfigure()
+        try:
+            if not self._set_enum_node_by_name("PixelFormat", pixel_format):
+                return None
+
+            current_pixel_format = self._read_enum_node_symbolic("PixelFormat")
+            if current_pixel_format:
+                self.spinnaker_native_pixel_format = current_pixel_format
+            updated_color_filter = self._read_enum_node_symbolic("PixelColorFilter")
+            if updated_color_filter:
+                self.spinnaker_color_filter = updated_color_filter
+            self.spinnaker_is_color = self.spinnaker_is_color or self._is_color_pixel_format(current_pixel_format)
+            self._refresh_camera_settings_cache(force=True)
+            return current_pixel_format or pixel_format
+        finally:
+            if paused_for_reconfigure:
+                self._resume_spinnaker_acquisition_after_reconfigure()
+
+    def set_camera_bit_depth(self, bit_depth: str) -> Optional[str]:
+        """Set the active camera's bit-depth / ADC mode when supported."""
+        bit_depth = str(bit_depth or "").strip()
+        if not self.is_genicam_camera() or not bit_depth:
+            return None
+
+        info = self._get_camera_bit_depth_info()
+        node_name = str(info.get("node_name", "") or "")
+        if not node_name or bit_depth not in info.get("options", []):
+            return None
+
+        paused_for_reconfigure = False
+        if self.is_spinnaker_camera() and self.isRunning():
+            paused_for_reconfigure = self._pause_spinnaker_acquisition_for_reconfigure()
+        try:
+            if not self._set_enum_node_by_name(node_name, bit_depth):
+                return None
+            self._refresh_camera_settings_cache(force=True)
+            return self._read_enum_node_symbolic(node_name) or bit_depth
+        finally:
+            if paused_for_reconfigure:
+                self._resume_spinnaker_acquisition_after_reconfigure()
 
     def get_camera_line_capabilities(self) -> List[Dict[str, object]]:
         """Enumerate GenICam camera line selectors, modes, and sources."""
@@ -1464,6 +1599,13 @@ class CameraWorker(QThread):
         color_filter = self._read_enum_node_symbolic("PixelColorFilter")
         if color_filter:
             cache["pixel_color_filter"] = color_filter
+        bit_depth_info = self._get_camera_bit_depth_info()
+        bit_depth = str(bit_depth_info.get("current", "") or "").strip()
+        if bit_depth:
+            cache["bit_depth"] = bit_depth
+        bit_depth_node = str(bit_depth_info.get("node_name", "") or "").strip()
+        if bit_depth_node:
+            cache["bit_depth_node"] = bit_depth_node
 
         self.camera_settings_cache = cache
         self.camera_settings_cache_time = now

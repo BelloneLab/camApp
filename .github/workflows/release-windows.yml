@@ -1,0 +1,122 @@
+name: Build And Release CamApp
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example v1.0.0"
+        required: true
+        type: string
+      release_name:
+        description: "Optional release title"
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as prerelease"
+        required: true
+        default: false
+        type: boolean
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    outputs:
+      release_tag: ${{ steps.release_meta.outputs.release_tag }}
+      release_name: ${{ steps.release_meta.outputs.release_name }}
+      prerelease: ${{ steps.release_meta.outputs.prerelease }}
+      draft: ${{ steps.release_meta.outputs.draft }}
+
+    steps:
+      - name: Resolve release metadata
+        id: release_meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $releaseTag = "${{ inputs.tag }}"
+            $releaseName = "${{ inputs.release_name }}"
+            $isPrerelease = "${{ inputs.prerelease }}"
+            $isDraft = "${{ inputs.draft }}"
+          } else {
+            $releaseTag = "${{ github.ref_name }}"
+            $releaseName = ""
+            $isPrerelease = "false"
+            $isDraft = "false"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($releaseName)) {
+            $releaseName = "CamApp $releaseTag"
+          }
+
+          "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "release_name=$releaseName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "prerelease=$isPrerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "draft=$isDraft" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build release artifact
+        shell: pwsh
+        run: |
+          .\scripts\build_release.ps1 -Version "${{ steps.release_meta.outputs.release_tag }}" -PythonExe python -Clean
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: CamApp-${{ steps.release_meta.outputs.release_tag }}-windows-x64
+          path: |
+            release/CamApp-${{ steps.release_meta.outputs.release_tag }}-windows-x64.zip
+            release/CamApp-${{ steps.release_meta.outputs.release_tag }}-windows-x64.sha256
+            release/CamApp-${{ steps.release_meta.outputs.release_tag }}-windows-x64-warn.txt
+          if-no-files-found: error
+
+  publish-release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: CamApp-${{ needs.build-windows.outputs.release_tag }}-windows-x64
+          path: release-assets
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-windows.outputs.release_tag }}
+          name: ${{ needs.build-windows.outputs.release_name }}
+          draft: ${{ needs.build-windows.outputs.draft == 'true' }}
+          prerelease: ${{ needs.build-windows.outputs.prerelease == 'true' }}
+          body_path: .github/release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/CamApp-${{ needs.build-windows.outputs.release_tag }}-windows-x64.zip
+            release-assets/CamApp-${{ needs.build-windows.outputs.release_tag }}-windows-x64.sha256
+            release-assets/CamApp-${{ needs.build-windows.outputs.release_tag }}-windows-x64-warn.txt
