@@ -8,9 +8,9 @@ dependencies:
       - PySide6>=6.6.0
       - pypylon>=2.0.0
       - flirpy>=0.4.0
-      - numpy>=1.24.0
+      - numpy>=1.24.0,<2
       - pandas>=2.0.0
-      - opencv-python>=4.8.0
+      - opencv-python>=4.8.0,<4.12
       - pyfirmata>=1.1.0
       - pyqtgraph>=0.13.0
       - pyinstaller>=6.6.0

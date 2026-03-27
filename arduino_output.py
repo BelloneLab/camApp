@@ -295,7 +295,7 @@ class ArduinoOutputWorker(QThread):
             if self.is_generating:
                 self._reset_signal_generators_locked(time.time())
 
-    def get_barcode_parameters(self) -> Dict[str, float]:
+    def get_barcode_parameters(self) -> Dict[str, Any]:
         """Return barcode state-machine parameters."""
         with QMutexLocker(self.mutex):
             word_duration = self._barcode_word_duration_seconds()
@@ -307,6 +307,7 @@ class ArduinoOutputWorker(QThread):
                 "interval_s": float(self.BARCODE_INTERVAL_S),
                 "word_duration_s": float(word_duration),
                 "cycle_duration_s": float(word_duration + self.BARCODE_INTERVAL_S),
+                "output_pins": self.pin_config.get("barcode", []).copy(),
             }
 
     def set_barcode_parameters(
@@ -1005,17 +1006,17 @@ class ArduinoOutputWorker(QThread):
                 bit_val = ((self.barcode_word >> shift) & 0x1) != 0
                 self._set_barcode_level_locked(bit_val)
                 self.barcode_bit_index += 1
+                self.barcode_next_time += self.BARCODE_BIT_S
                 if self.barcode_bit_index >= self.BARCODE_BITS:
                     self.barcode_state = self.BC_GAP
-                    self.barcode_next_time += self._barcode_gap_seconds()
-                else:
-                    self.barcode_next_time += self.BARCODE_BIT_S
 
             else:
                 self._set_barcode_level_locked(False)
                 self.barcode_word = (self.barcode_word + 1) & ((1 << self.BARCODE_BITS) - 1)
+                gap_s = self._barcode_gap_seconds()
                 self.barcode_state = self.BC_START_HI
-                # Keep barcode_next_time unchanged to start immediately after gap.
+                if gap_s > 0.0:
+                    self.barcode_next_time += gap_s
 
             guard += 1
         if guard >= 256:

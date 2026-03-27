@@ -3,13 +3,15 @@
 #
 # Note: FFmpeg is used by the app for recording, but it is not a Python
 # package. Install FFmpeg separately and make sure it is available on PATH.
+# Note: FLIR Spinnaker support uses the vendor-provided PySpin wheel from the
+# Spinnaker SDK and is not installed from PyPI here.
 
 PySide6
-numpy
+numpy>=1.24,<2
 pyqtgraph
 pypylon
 flirpy
-opencv-python
+opencv-python>=4.8,<4.12
 pandas
 pyserial
 pyfirmata

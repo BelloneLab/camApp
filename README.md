@@ -5,8 +5,9 @@ This app records Basler, FLIR, or USB camera video with synchronized Arduino TTL
 ## Features
 
 - Basler, FLIR, and USB camera support
-- Basler via Pylon, FLIR thermal cameras via `flirpy`, USB via OpenCV
+- Basler via Pylon, FLIR machine-vision cameras via Spinnaker / `PySpin`, FLIR thermal cameras via `flirpy`, USB via OpenCV
 - Live view with optional ROI cropping
+- Collapsible bottom control strip so acquisition and recording panels can be hidden while the record button stays visible
 - Recording with FFmpeg (GPU or CPU encoders)
 - Per-frame metadata logging (timestamp, exposure, thermal statistics, GPIO line status when available)
 - Arduino TTL I/O via pyFirmata with live TTL plot
@@ -21,7 +22,12 @@ This app records Basler, FLIR, or USB camera video with synchronized Arduino TTL
 
 Optional:
 - Basler Pylon SDK + `pypylon` (camera drivers)
+- FLIR Spinnaker SDK + `PySpin` for FLIR machine-vision cameras
 - `flirpy` for FLIR Boson, Lepton, and TeAx/Tau integrations
+
+Compatibility note:
+
+- `PySpin` 3.2.x is not compatible with NumPy 2.x in this project. Use `numpy<2` in the CamApp environment when you need FLIR Spinnaker support.
 
 ## Environment Setup
 
@@ -39,6 +45,26 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+## FLIR Spinnaker Setup
+
+CamApp now supports two different FLIR paths:
+
+- FLIR machine-vision cameras through Teledyne FLIR Spinnaker + `PySpin`
+- FLIR thermal cameras through `flirpy`
+
+For FLIR machine-vision cameras such as Blackfly / Chameleon / Grasshopper:
+
+1. Install the Spinnaker SDK for your Windows/Python build from Teledyne FLIR.
+2. Install the matching `PySpin` wheel provided with Spinnaker.
+3. Confirm `import PySpin` works in the same environment used to launch CamApp.
+4. Restart CamApp and scan cameras again.
+
+Notes:
+
+- `PySpin` is not installed from `requirements.txt`; the wheel must come from the Spinnaker SDK package and must match your Python version and architecture.
+- If `PySpin` imports fail with `_ARRAY_API not found` or `numpy.core.multiarray failed to import`, the environment is using NumPy 2.x; downgrade to `numpy<2`.
+- `simple_pyspin` and `EasyPySpin` are useful for standalone diagnostics, but CamApp uses raw `PySpin` directly so the app can manage acquisition and GenICam nodes itself.
 
 ## FFmpeg (Required)
 
@@ -80,10 +106,23 @@ python main.py
 
 ## FLIR Support Notes
 
-- FLIR discovery is provided through `flirpy` and appears in the same source list as Basler and generic USB devices.
+- FLIR Spinnaker cameras appear in the same source list as Basler and USB cameras when `PySpin` is installed.
+- FLIR thermal cameras discovered via `flirpy` also appear in the same source list.
 - Basler exposes camera GPIO state through chunk metadata when supported by the device.
-- FLIR backends do not expose Basler-style per-frame line status chunks, so CamApp keeps Arduino as the general GPIO read/write and synchronization layer for FLIR workflows.
+- FLIR Spinnaker cameras now use direct camera-node control in the app for:
+  frame rate via `AcquisitionFrameRate`
+  exposure via `ExposureAuto` + `ExposureMode` + `ExposureTime`
+  ROI / resolution via `Width`, `Height`, `OffsetX`, and `OffsetY`
+  manual gain via `GainAuto` + `Gain`
+- Recording `Max Length` is now applied against the active recording FPS used by the worker, and changing the limit during an active trial updates the current trial immediately.
+- On color FLIR Spinnaker cameras, CamApp can preview and record `BGR8` even when the camera is streaming a native Bayer format such as `BayerRG8`; the app debayers on the host side when direct in-camera RGB output is unavailable.
+- FLIR thermal backends do not expose Basler-style per-frame line status chunks, so CamApp keeps Arduino as the general GPIO read/write and synchronization layer for those workflows.
 - FLIR thermal frames are normalized to 8-bit for preview and MP4 recording; raw thermal min/max/mean values are still logged per frame in CSV metadata.
+- On Spinnaker cameras, frame rate, exposure time, ROI size, and gain remain coupled by sensor and bus limits; if a requested value is outside the camera limits, CamApp clamps it to the nearest valid node value.
+- For stable high-rate acquisition on FLIR Spinnaker cameras, prefer:
+  shorter exposures than the frame period
+  smaller ROI / resolution when you need higher FPS
+  `Mono8` when color is not needed, because it reduces bandwidth and host conversion load
 
 ## Arduino Firmata Setup (Optional)
 
@@ -126,5 +165,6 @@ Note: The compiled EXE still requires FFmpeg available on PATH at runtime.
 - "FFmpeg not found": add FFmpeg to PATH and restart the terminal.
 - "Failed to start Arduino TTLs": make sure no other app is holding the COM port, then reconnect.
 - "No Basler camera found": verify Pylon is installed and the camera is detected by Pylon Viewer.
-- FLIR camera missing from the list: verify `flirpy` is installed and Windows still sees the device as a USB video device.
+- FLIR Spinnaker camera missing from the list: verify Spinnaker is installed, `import PySpin` works, and the camera is visible in SpinView.
+- FLIR thermal camera missing from the list: verify `flirpy` is installed and Windows still sees the device as a USB video device.
 - "No USB camera found": verify the device is connected and not in use by another app.

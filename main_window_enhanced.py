@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QFileDialog, QScrollArea, QFormLayout, QTextEdit,
                                QFrame, QSlider, QGridLayout,
                                QCheckBox, QToolButton, QDialog, QStackedWidget,
-                               QDialogButtonBox, QStyle, QToolBar,
+                               QDialogButtonBox, QStyle, QToolBar, QToolTip,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QMessageBox, QSizePolicy)
 from PySide6.QtCore import Qt, Slot, QTimer, QSettings, QSize, QPointF, QRectF
@@ -28,10 +28,31 @@ from camera_backends import (
     discover_basler_cameras,
     discover_flir_cameras,
     discover_usb_cameras,
-    pylon,
+    get_camera_backend_diagnostics,
 )
 from camera_worker import CameraWorker
 from arduino_output import ArduinoOutputWorker
+
+
+class HoverLabelToolButton(QToolButton):
+    """Compact icon rail button with an instant hover label."""
+
+    def __init__(self, hover_label: str, tooltip_alignment: str = "right", parent=None):
+        super().__init__(parent)
+        self.hover_label = hover_label
+        self.tooltip_alignment = tooltip_alignment
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if not self.hover_label:
+            return
+        anchor = self.mapToGlobal(self.rect().center())
+        offset_x = 26 if self.tooltip_alignment != "left" else -26
+        QToolTip.showText(anchor + QPointF(offset_x, 0).toPoint(), self.hover_label, self, self.rect())
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -69,6 +90,9 @@ class MainWindow(QMainWindow):
         self.default_width = int(self.settings.value('camera_width', 1080))
         self.default_height = int(self.settings.value('camera_height', 1080))
         self.default_image_format = self.settings.value('image_format', 'Mono8')
+        self.frame_drop_monitor_visible = str(self.settings.value("frame_drop_monitor_visible", 1)).strip().lower() not in (
+            "0", "false", "no", "off"
+        )
         self.signal_display_config = self._load_signal_display_config()
 
         # Recording state
@@ -119,6 +143,8 @@ class MainWindow(QMainWindow):
         self.label_behavior_status: Optional[QLabel] = None
         self.label_frame_drop_summary: Optional[QLabel] = None
         self.frame_drop_log: Optional[QTextEdit] = None
+        self.frame_drop_panel: Optional[QWidget] = None
+        self.btn_toggle_frame_drop_panel: Optional[QPushButton] = None
         self.live_placeholder_auto_ranged = False
         self.live_frame_auto_ranged = False
         self.roi_item: Optional[pg.RectROI] = None
@@ -135,6 +161,9 @@ class MainWindow(QMainWindow):
         self.workspace_toolbar: Optional[QToolBar] = None
         self.left_panel_shell: Optional[QFrame] = None
         self.right_panel_shell: Optional[QFrame] = None
+        self.acquisition_workspace_card: Optional[QFrame] = None
+        self.recording_workspace_card: Optional[QFrame] = None
+        self.workspace_controls_content: Optional[QWidget] = None
         self.left_panel_stack: Optional[QStackedWidget] = None
         self.right_panel_stack: Optional[QStackedWidget] = None
         self.left_panel_title: Optional[QLabel] = None
@@ -145,6 +174,9 @@ class MainWindow(QMainWindow):
         self.right_panel_pages: Dict[str, QWidget] = {}
         self.current_left_panel_key: Optional[str] = None
         self.current_right_panel_key: Optional[str] = None
+        self.btn_toggle_acquisition_panel: Optional[QPushButton] = None
+        self.btn_toggle_recording_panel: Optional[QPushButton] = None
+        self.btn_record: Optional[QPushButton] = None
         self.planner_table: Optional[QTableWidget] = None
         self.planner_default_columns = [
             "Status",
@@ -167,6 +199,8 @@ class MainWindow(QMainWindow):
         self.planner_reattaching = False
         self.advanced_dialog: Optional[QDialog] = None
         self.filename_order_boxes: List[QComboBox] = []
+        self._filename_field_syncing = False
+        self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
         self.meta_trial: Optional[QLineEdit] = None
         self.meta_condition: Optional[QLineEdit] = None
         self.meta_arena: Optional[QLineEdit] = None
@@ -274,6 +308,24 @@ class MainWindow(QMainWindow):
             QPushButton#ghostButton:hover {
                 background: #152436;
             }
+            QPushButton#toggleButton {
+                background: #101b29;
+                border: 1px solid #33506f;
+                color: #9fd9ff;
+                border-radius: 14px;
+                padding: 5px 12px;
+            }
+            QPushButton#toggleButton:hover {
+                background: #152436;
+                border-color: #46739f;
+                color: #eef6ff;
+            }
+            QPushButton#toggleButton:checked {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #123456, stop:1 #205b85);
+                border: 1px solid #71c2ff;
+                color: #eef8ff;
+            }
             QPushButton#successButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #3dbb67, stop:1 #69cf4a);
@@ -298,11 +350,12 @@ class MainWindow(QMainWindow):
             QToolButton#navButton {
                 background: #0d1725;
                 border: 1px solid #22344e;
-                border-radius: 20px;
-                padding: 8px 5px;
-                min-width: 68px;
-                max-width: 68px;
-                min-height: 70px;
+                border-radius: 18px;
+                padding: 8px;
+                min-width: 44px;
+                max-width: 44px;
+                min-height: 44px;
+                max-height: 44px;
                 color: #9bb4d2;
                 font-weight: 700;
                 font-size: 11px;
@@ -329,6 +382,24 @@ class MainWindow(QMainWindow):
             QComboBox::drop-down {
                 border: none;
                 width: 24px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #07101a;
+                color: #eef6ff;
+                border: 1px solid #243851;
+                selection-background-color: #173150;
+                selection-color: #ffffff;
+                outline: 0;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 24px;
+                padding: 6px 10px;
+                color: #eef6ff;
+                background: transparent;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #173150;
+                color: #ffffff;
             }
             QCheckBox {
                 spacing: 8px;
@@ -485,10 +556,10 @@ class MainWindow(QMainWindow):
         """Create one vertical navigation rail."""
         rail = QFrame()
         rail.setObjectName("SideRail")
-        rail.setFixedWidth(84)
+        rail.setFixedWidth(62)
         layout = QVBoxLayout(rail)
-        layout.setContentsMargins(8, 12, 8, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(7, 12, 7, 12)
+        layout.setSpacing(10)
 
         specs = []
         button_store = self.left_nav_buttons if side == "left" else self.right_nav_buttons
@@ -507,7 +578,7 @@ class MainWindow(QMainWindow):
             ]
 
         for key, label, icon_kind, accent, title in specs:
-            button = self._create_nav_button(label, icon_kind, accent)
+            button = self._create_nav_button(label, icon_kind, accent, side=side)
             button.clicked.connect(
                 lambda checked=False, s=side, panel_key=key, panel_title=title: self._toggle_side_panel(s, panel_key, panel_title)
             )
@@ -599,16 +670,18 @@ class MainWindow(QMainWindow):
         if other_shell is not None and other_shell.isVisible():
             self._hide_side_panel(other_side)
 
-    def _create_nav_button(self, label: str, icon_kind: str, accent: str) -> QToolButton:
-        """Create one modern navigation button with a custom icon."""
-        button = QToolButton()
+    def _create_nav_button(self, label: str, icon_kind: str, accent: str, side: str = "left") -> QToolButton:
+        """Create one compact navigation button with hover-only labeling."""
+        button = HoverLabelToolButton(label, tooltip_alignment="right" if side == "left" else "left")
         button.setObjectName("navButton")
         button.setCheckable(True)
-        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        button.setToolButtonStyle(Qt.ToolButtonIconOnly)
         button.setIcon(self._build_modern_icon(icon_kind, accent))
-        button.setIconSize(QSize(28, 28))
-        button.setText(label)
+        button.setIconSize(QSize(24, 24))
+        button.setText("")
         button.setToolTip(label)
+        button.setStatusTip(label)
+        button.setAccessibleName(label)
         return button
 
     def _toggle_side_panel(self, side: str, panel_key: str, title: str):
@@ -677,33 +750,98 @@ class MainWindow(QMainWindow):
         live_layout.setContentsMargins(12, 12, 12, 12)
         live_layout.addWidget(self._create_live_view_panel(), 1)
 
-        controls_row = QHBoxLayout()
-        controls_row.setSpacing(14)
-
-        acquisition_card = QFrame()
-        acquisition_card.setObjectName("WorkspaceCard")
-        acquisition_card.setMinimumWidth(0)
-        acquisition_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        acquisition_layout = QVBoxLayout(acquisition_card)
+        self.acquisition_workspace_card = QFrame()
+        self.acquisition_workspace_card.setObjectName("WorkspaceCard")
+        self.acquisition_workspace_card.setMinimumWidth(0)
+        self.acquisition_workspace_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        acquisition_layout = QVBoxLayout(self.acquisition_workspace_card)
         acquisition_layout.setContentsMargins(14, 14, 14, 14)
         acquisition_layout.addWidget(self._create_camera_settings())
 
-        session_card = QFrame()
-        session_card.setObjectName("WorkspaceCard")
-        session_card.setMinimumWidth(0)
-        session_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        session_layout = QVBoxLayout(session_card)
-        session_layout.setContentsMargins(14, 14, 14, 14)
-        session_layout.addWidget(self._create_control_panel())
+        self.recording_workspace_card = QFrame()
+        self.recording_workspace_card.setObjectName("WorkspaceCard")
+        self.recording_workspace_card.setMinimumWidth(0)
+        self.recording_workspace_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        recording_layout = QVBoxLayout(self.recording_workspace_card)
+        recording_layout.setContentsMargins(14, 14, 14, 14)
+        recording_layout.addWidget(self._create_control_panel())
 
-        controls_row.addWidget(acquisition_card, 1)
-        controls_row.addWidget(session_card, 1)
+        if self.btn_record is None:
+            self.btn_record = QPushButton("Start Recording")
+            self._set_button_icon(self.btn_record, "record", "#07260e", "successButton")
+            self.btn_record.clicked.connect(self._on_record_clicked)
+            self.btn_record.setEnabled(False)
+            self.btn_record.setMinimumHeight(42)
+            self.btn_record.setMinimumWidth(220)
+
+        controls_shell = QFrame()
+        controls_shell.setObjectName("WorkspaceCard")
+        controls_shell.setMinimumWidth(0)
+        controls_shell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        controls_layout = QVBoxLayout(controls_shell)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
+        controls_layout.setSpacing(10)
+
+        controls_toolbar = QHBoxLayout()
+        controls_toolbar.setSpacing(10)
+
+        controls_title = QLabel("Workspace Controls")
+        controls_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #eef6ff;")
+        controls_toolbar.addWidget(controls_title)
+
+        controls_hint = QLabel("Open the panels only when you need them so preview keeps the space.")
+        controls_hint.setStyleSheet("color: #8fa6bf;")
+        controls_toolbar.addWidget(controls_hint)
+        controls_toolbar.addStretch()
+
+        self.btn_toggle_acquisition_panel = QPushButton("Acquisition")
+        self._set_button_icon(self.btn_toggle_acquisition_panel, "settings", "#7cc7ff", "toggleButton")
+        self.btn_toggle_acquisition_panel.setCheckable(True)
+        self.btn_toggle_acquisition_panel.setChecked(False)
+        self.btn_toggle_acquisition_panel.toggled.connect(self._update_workspace_controls_visibility)
+        controls_toolbar.addWidget(self.btn_toggle_acquisition_panel)
+
+        self.btn_toggle_recording_panel = QPushButton("Recording")
+        self._set_button_icon(self.btn_toggle_recording_panel, "session", "#9bf57f", "toggleButton")
+        self.btn_toggle_recording_panel.setCheckable(True)
+        self.btn_toggle_recording_panel.setChecked(False)
+        self.btn_toggle_recording_panel.toggled.connect(self._update_workspace_controls_visibility)
+        controls_toolbar.addWidget(self.btn_toggle_recording_panel)
+
+        controls_toolbar.addSpacing(8)
+        controls_toolbar.addWidget(self.btn_record)
+        controls_layout.addLayout(controls_toolbar)
+
+        self.workspace_controls_content = QWidget()
+        controls_row = QHBoxLayout(self.workspace_controls_content)
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(14)
+        controls_row.addWidget(self.acquisition_workspace_card, 1)
+        controls_row.addWidget(self.recording_workspace_card, 1)
         controls_row.setStretch(0, 4)
         controls_row.setStretch(1, 5)
+        controls_layout.addWidget(self.workspace_controls_content)
 
-        layout.addWidget(live_card, 5)
-        layout.addLayout(controls_row, 2)
+        layout.addWidget(live_card, 1)
+        layout.addWidget(controls_shell, 0)
+        self._update_workspace_controls_visibility()
         return container
+
+    def _update_workspace_controls_visibility(self):
+        """Show or hide bottom workspace panels while keeping record controls visible."""
+        acquisition_visible = bool(
+            self.btn_toggle_acquisition_panel is not None and self.btn_toggle_acquisition_panel.isChecked()
+        )
+        recording_visible = bool(
+            self.btn_toggle_recording_panel is not None and self.btn_toggle_recording_panel.isChecked()
+        )
+
+        if self.acquisition_workspace_card is not None:
+            self.acquisition_workspace_card.setVisible(acquisition_visible)
+        if self.recording_workspace_card is not None:
+            self.recording_workspace_card.setVisible(recording_visible)
+        if self.workspace_controls_content is not None:
+            self.workspace_controls_content.setVisible(acquisition_visible or recording_visible)
 
     def _create_metric_tile(self, title: str, value: str, accent: str):
         """Create a compact dashboard tile used for planner/session counts."""
@@ -930,6 +1068,21 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.label_filename_formula)
         card_layout.addWidget(preview_group)
 
+        behavior_defaults_group = QGroupBox("Behavior / TTL Defaults")
+        behavior_defaults_layout = QVBoxLayout(behavior_defaults_group)
+        behavior_defaults_hint = QLabel(
+            "Define the default board pins, signal labels/roles, and camera line labels from one popup."
+        )
+        behavior_defaults_hint.setWordWrap(True)
+        behavior_defaults_hint.setStyleSheet("color: #8fa6bf;")
+        behavior_defaults_layout.addWidget(behavior_defaults_hint)
+
+        self.btn_open_behavior_defaults = QPushButton("Behavior Defaults Menu")
+        self._set_button_icon(self.btn_open_behavior_defaults, "settings", "#7cc7ff", "ghostButton")
+        self.btn_open_behavior_defaults.clicked.connect(self._open_behavior_defaults_dialog)
+        behavior_defaults_layout.addWidget(self.btn_open_behavior_defaults)
+        card_layout.addWidget(behavior_defaults_group)
+
         self.btn_open_advanced_settings = QPushButton("Advanced Camera Menu")
         self._set_button_icon(self.btn_open_advanced_settings, "settings", "#d86cff", "violetButton")
         self.btn_open_advanced_settings.clicked.connect(self._toggle_advanced_settings)
@@ -1149,6 +1302,13 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 700; color: #edf4ff;")
         header_layout.addWidget(title)
 
+        self.btn_toggle_frame_drop_panel = QPushButton("Frame Drop")
+        self._set_button_icon(self.btn_toggle_frame_drop_panel, "pulse", "#7cc7ff", "toggleButton")
+        self.btn_toggle_frame_drop_panel.setCheckable(True)
+        self.btn_toggle_frame_drop_panel.setChecked(bool(self.frame_drop_monitor_visible))
+        self.btn_toggle_frame_drop_panel.toggled.connect(self._update_frame_drop_panel_visibility)
+        header_layout.addWidget(self.btn_toggle_frame_drop_panel)
+
         self.live_status_badge = self._make_panel_chip("Offline", "warning")
         self.live_header_status = self._make_panel_chip("No camera connected", "default")
         self.live_header_resolution = self._make_panel_chip("-- x --", "default")
@@ -1162,7 +1322,9 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.live_header_mode)
         header_layout.addWidget(self.live_header_roi)
         layout.addWidget(header)
-        layout.addWidget(self._create_frame_drop_panel())
+        self.frame_drop_panel = self._create_frame_drop_panel()
+        layout.addWidget(self.frame_drop_panel)
+        self._update_frame_drop_panel_visibility(bool(self.frame_drop_monitor_visible))
 
         plot_item = pg.PlotItem()
         plot_item.hideAxis("left")
@@ -1232,6 +1394,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.frame_drop_log)
         self._reset_frame_drop_display()
         return panel
+
+    def _update_frame_drop_panel_visibility(self, visible: Optional[bool] = None):
+        """Show or hide the frame-drop monitor strip from the live-view header toggle."""
+        if visible is None:
+            visible = bool(
+                self.btn_toggle_frame_drop_panel is not None and self.btn_toggle_frame_drop_panel.isChecked()
+            )
+        visible = bool(visible)
+        self.frame_drop_monitor_visible = visible
+        self.settings.setValue("frame_drop_monitor_visible", int(visible))
+
+        if self.btn_toggle_frame_drop_panel is not None and self.btn_toggle_frame_drop_panel.isChecked() != visible:
+            self.btn_toggle_frame_drop_panel.blockSignals(True)
+            self.btn_toggle_frame_drop_panel.setChecked(visible)
+            self.btn_toggle_frame_drop_panel.blockSignals(False)
+
+        if self.frame_drop_panel is not None:
+            self.frame_drop_panel.setVisible(visible)
 
     def _create_trial_planner_panel(self) -> QWidget:
         """Build the multi-trial recording planner dock."""
@@ -1407,6 +1587,8 @@ class MainWindow(QMainWindow):
 
         for widget in (self.meta_animal_id, self.meta_trial, self.meta_experiment, self.meta_condition, self.meta_arena):
             widget.textChanged.connect(self._update_filename_preview)
+            widget.textChanged.connect(self._save_recording_form_state)
+        self.meta_notes.textChanged.connect(self._save_recording_form_state)
 
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
@@ -1503,6 +1685,50 @@ class MainWindow(QMainWindow):
         self.advanced_dialog.resize(560, 420)
         dialog_layout = QVBoxLayout(self.advanced_dialog)
 
+        self.performance_group = QGroupBox("Preview and Pipeline")
+        performance_layout = QFormLayout()
+
+        self.check_preview_enabled = QCheckBox("Enable live preview")
+        self.check_preview_enabled.setChecked(True)
+        self.check_preview_enabled.toggled.connect(self._on_preview_enabled_changed)
+        performance_layout.addRow("", self.check_preview_enabled)
+
+        self.spin_preview_fps = QDoubleSpinBox()
+        self.spin_preview_fps.setRange(1.0, 60.0)
+        self.spin_preview_fps.setDecimals(1)
+        self.spin_preview_fps.setSingleStep(1.0)
+        self.spin_preview_fps.setValue(25.0)
+        self.spin_preview_fps.setSuffix(" fps")
+        self.spin_preview_fps.valueChanged.connect(self._on_preview_fps_changed)
+        performance_layout.addRow("Preview FPS:", self.spin_preview_fps)
+
+        self.spin_preview_width = QSpinBox()
+        self.spin_preview_width.setRange(0, 4096)
+        self.spin_preview_width.setSingleStep(64)
+        self.spin_preview_width.setSpecialValueText("Full resolution")
+        self.spin_preview_width.setValue(1280)
+        self.spin_preview_width.valueChanged.connect(self._on_preview_width_changed)
+        performance_layout.addRow("Preview Max Width:", self.spin_preview_width)
+
+        self.spin_frame_buffer = QSpinBox()
+        self.spin_frame_buffer.setRange(8, 512)
+        self.spin_frame_buffer.setSingleStep(8)
+        self.spin_frame_buffer.setValue(128)
+        self.spin_frame_buffer.setSuffix(" frames")
+        self.spin_frame_buffer.valueChanged.connect(self._on_frame_buffer_size_changed)
+        performance_layout.addRow("Frame Buffer:", self.spin_frame_buffer)
+
+        self.spin_metadata_stats_interval = QSpinBox()
+        self.spin_metadata_stats_interval.setRange(0, 240)
+        self.spin_metadata_stats_interval.setSingleStep(1)
+        self.spin_metadata_stats_interval.setSpecialValueText("Off")
+        self.spin_metadata_stats_interval.setValue(25)
+        self.spin_metadata_stats_interval.valueChanged.connect(self._on_metadata_stats_interval_changed)
+        performance_layout.addRow("Raw Stats Every:", self.spin_metadata_stats_interval)
+
+        self.performance_group.setLayout(performance_layout)
+        dialog_layout.addWidget(self.performance_group)
+
         self.advanced_group = QGroupBox("Advanced Video")
         advanced_layout = QFormLayout()
 
@@ -1536,6 +1762,21 @@ class MainWindow(QMainWindow):
         self.spin_gain = QDoubleSpinBox()
         self.spin_gain.valueChanged.connect(self._on_gain_changed)
         advanced_layout.addRow("Gain:", self.spin_gain)
+
+        self.combo_white_balance_auto = QComboBox()
+        self.combo_white_balance_auto.addItems(["Continuous", "Off"])
+        self.combo_white_balance_auto.currentTextChanged.connect(self._on_white_balance_auto_changed)
+        advanced_layout.addRow("White Balance:", self.combo_white_balance_auto)
+
+        self.spin_white_balance_red = QDoubleSpinBox()
+        self.spin_white_balance_red.setDecimals(4)
+        self.spin_white_balance_red.valueChanged.connect(self._on_white_balance_red_changed)
+        advanced_layout.addRow("WB Red:", self.spin_white_balance_red)
+
+        self.spin_white_balance_blue = QDoubleSpinBox()
+        self.spin_white_balance_blue.setDecimals(4)
+        self.spin_white_balance_blue.valueChanged.connect(self._on_white_balance_blue_changed)
+        advanced_layout.addRow("WB Blue:", self.spin_white_balance_blue)
 
         self.spin_brightness = QDoubleSpinBox()
         self.spin_brightness.valueChanged.connect(self._on_brightness_changed)
@@ -1613,12 +1854,13 @@ class MainWindow(QMainWindow):
         filename_layout.addWidget(QLabel("Filename preview:"))
 
         self.edit_filename = QLineEdit()
-        self.edit_filename.setPlaceholderText("Generated from metadata")
-        self.edit_filename.setReadOnly(True)
+        self.edit_filename.setPlaceholderText("Type a custom filename or leave blank for auto-generated")
+        self.edit_filename.textEdited.connect(self._on_filename_text_edited)
+        self.edit_filename.editingFinished.connect(self._on_filename_editing_finished)
         filename_layout.addWidget(self.edit_filename, stretch=2)
         control_layout.addLayout(filename_layout)
 
-        self.label_filename_hint = QLabel("Pattern follows the order set in General Settings.")
+        self.label_filename_hint = QLabel("Type a custom filename here, or leave it empty to follow General Settings.")
         self.label_filename_hint.setStyleSheet("color: #8fa6bf;")
         control_layout.addWidget(self.label_filename_hint)
 
@@ -1650,12 +1892,12 @@ class MainWindow(QMainWindow):
         length_layout.addStretch()
         control_layout.addLayout(length_layout)
 
-        self.btn_record = QPushButton("Start Recording")
-        self._set_button_icon(self.btn_record, "record", "#07260e", "successButton")
-        self.btn_record.clicked.connect(self._on_record_clicked)
-        self.btn_record.setEnabled(False)
-        self.btn_record.setMinimumHeight(40)
-        control_layout.addWidget(self.btn_record)
+        self.spin_hours.valueChanged.connect(self._on_recording_length_controls_changed)
+        self.spin_minutes.valueChanged.connect(self._on_recording_length_controls_changed)
+        self.spin_seconds.valueChanged.connect(self._on_recording_length_controls_changed)
+        self.check_unlimited.currentTextChanged.connect(self._on_recording_length_controls_changed)
+
+        control_layout.addStretch()
 
         control_group.setLayout(control_layout)
         return control_group
@@ -1781,24 +2023,28 @@ class MainWindow(QMainWindow):
 
         line_group = QGroupBox("Camera Input Labels")
         line_layout = QFormLayout()
-        line_options = ["None", "Gate", "Sync", "Barcode", "Lever", "Cue", "Reward", "ITI"]
+        line_options = self._line_label_choice_list()
 
         self.combo_line1_label = QComboBox()
+        self.combo_line1_label.setEditable(True)
         self.combo_line1_label.addItems(line_options)
         self.combo_line1_label.currentTextChanged.connect(lambda v: self._on_line_label_changed(1, v))
         line_layout.addRow("Line 1:", self.combo_line1_label)
 
         self.combo_line2_label = QComboBox()
+        self.combo_line2_label.setEditable(True)
         self.combo_line2_label.addItems(line_options)
         self.combo_line2_label.currentTextChanged.connect(lambda v: self._on_line_label_changed(2, v))
         line_layout.addRow("Line 2:", self.combo_line2_label)
 
         self.combo_line3_label = QComboBox()
+        self.combo_line3_label.setEditable(True)
         self.combo_line3_label.addItems(line_options)
         self.combo_line3_label.currentTextChanged.connect(lambda v: self._on_line_label_changed(3, v))
         line_layout.addRow("Line 3:", self.combo_line3_label)
 
         self.combo_line4_label = QComboBox()
+        self.combo_line4_label.setEditable(True)
         self.combo_line4_label.addItems(line_options)
         self.combo_line4_label.currentTextChanged.connect(lambda v: self._on_line_label_changed(4, v))
         line_layout.addRow("Line 4:", self.combo_line4_label)
@@ -2269,6 +2515,482 @@ class MainWindow(QMainWindow):
             pins.append(int(token))
         return pins
 
+    def _current_barcode_output_pins(self) -> List[int]:
+        """Return the current barcode output pin list from UI/settings."""
+        defaults = self._default_behavior_pin_map().get("barcode", []).copy()
+
+        try:
+            pin_map = self._current_behavior_pin_map() if self.behavior_pin_edits else {}
+        except Exception:
+            pin_map = {}
+
+        pins = [int(pin) for pin in pin_map.get("barcode", [])]
+        if pins:
+            return pins
+
+        raw_setting = self.settings.value("behavior_pin_barcode", self._format_pin_list(defaults))
+        try:
+            parsed = self._parse_pin_text(str(raw_setting))
+        except Exception:
+            parsed = []
+        return parsed if parsed else defaults
+
+    def _apply_barcode_output_pins(self, pins: List[int], persist: bool = True):
+        """Apply one or two mirrored barcode output pins through the normal mapping path."""
+        normalized = []
+        seen = set()
+        for pin in pins:
+            try:
+                parsed = int(pin)
+            except Exception:
+                continue
+            if parsed in seen:
+                continue
+            seen.add(parsed)
+            normalized.append(parsed)
+
+        if not normalized:
+            normalized = self._default_behavior_pin_map().get("barcode", []).copy()
+
+        pin_text = self._format_pin_list(normalized)
+        pin_edit = self.behavior_pin_edits.get("barcode")
+        if pin_edit is not None:
+            pin_edit.setText(pin_text)
+
+        self.settings.setValue("barcode_mirror_enabled", int(len(normalized) > 1))
+        self.settings.setValue("barcode_mirror_pin", int(normalized[1]) if len(normalized) > 1 else -1)
+
+        if pin_edit is not None:
+            self._apply_behavior_pin_configuration(persist=persist)
+            return
+
+        if persist:
+            self.settings.setValue("behavior_pin_barcode", pin_text)
+            self.settings.sync()
+
+        if self.arduino_worker:
+            self.arduino_worker.set_manual_pin_config({"barcode": normalized})
+
+        if "barcode" in self.pin_value_labels:
+            self.pin_value_labels["barcode"].setText(pin_text)
+
+    def _factory_behavior_defaults_snapshot(self) -> Dict[str, Dict]:
+        """Return the app-default behavior/TTL configuration."""
+        default_roles = self._default_behavior_roles()
+        default_pins = self._default_behavior_pin_map()
+        signals = {}
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            signals[key] = {
+                "enabled": True,
+                "label": str(self.DISPLAY_SIGNAL_META[key]["name"]),
+                "role": str(default_roles.get(key, self.DISPLAY_SIGNAL_META[key]["role"])),
+                "pins": default_pins.get(key, []).copy(),
+            }
+        return {
+            "signals": signals,
+            "line_labels": {line: "None" for line in range(1, 5)},
+        }
+
+    def _behavior_defaults_snapshot(self) -> Dict[str, Dict]:
+        """Collect the current persisted/live behavior defaults."""
+        snapshot = self._factory_behavior_defaults_snapshot()
+        pin_map = self._current_behavior_pin_map() if self.behavior_pin_edits else self._default_behavior_pin_map()
+        role_map = self._current_behavior_roles() if self.behavior_role_boxes else self._default_behavior_roles()
+
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            default_entry = snapshot["signals"][key]
+
+            enabled_check = self.signal_enabled_checks.get(key)
+            if enabled_check is not None:
+                enabled_value = bool(enabled_check.isChecked())
+            else:
+                enabled_raw = self.settings.value(f"behavior_signal_enabled_{key}", int(default_entry["enabled"]))
+                enabled_value = str(enabled_raw).strip().lower() not in ("0", "false", "no", "off")
+
+            label_edit = self.signal_label_edits.get(key)
+            if label_edit is not None:
+                label_value = label_edit.text().strip() or default_entry["label"]
+            else:
+                label_value = str(self.settings.value(f"behavior_signal_label_{key}", default_entry["label"])).strip()
+                if not label_value:
+                    label_value = default_entry["label"]
+
+            snapshot["signals"][key] = {
+                "enabled": bool(enabled_value),
+                "label": label_value,
+                "role": str(role_map.get(key, default_entry["role"])),
+                "pins": [int(pin) for pin in pin_map.get(key, default_entry["pins"])],
+            }
+
+        for line in range(1, 5):
+            combo = getattr(self, f"combo_line{line}_label", None)
+            if combo is not None:
+                value = combo.currentText()
+            else:
+                value = str(self.settings.value(f"line_label_{line}", "None"))
+            snapshot["line_labels"][line] = value if value else "None"
+
+        return snapshot
+
+    def _apply_behavior_defaults_snapshot(self, snapshot: Dict[str, Dict], persist: bool = True):
+        """Apply one behavior-default snapshot back into the main UI and worker."""
+        signals = snapshot.get("signals", {})
+        line_labels = snapshot.get("line_labels", {})
+
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            entry = signals.get(key, {})
+            default_label = str(self.DISPLAY_SIGNAL_META[key]["name"])
+            label_value = str(entry.get("label", default_label)).strip() or default_label
+            role_value = str(entry.get("role", self.DISPLAY_SIGNAL_META[key]["role"]))
+            pins = [int(pin) for pin in entry.get("pins", [])]
+            enabled_value = bool(entry.get("enabled", True))
+
+            label_edit = self.signal_label_edits.get(key)
+            if label_edit is not None:
+                label_edit.setText(label_value)
+
+            role_box = self.behavior_role_boxes.get(key)
+            if role_box is not None:
+                role_box.blockSignals(True)
+                if role_value in [role_box.itemText(i) for i in range(role_box.count())]:
+                    role_box.setCurrentText(role_value)
+                role_box.blockSignals(False)
+
+            pin_edit = self.behavior_pin_edits.get(key)
+            if pin_edit is not None:
+                pin_edit.setText(self._format_pin_list(pins))
+
+            enabled_check = self.signal_enabled_checks.get(key)
+            if enabled_check is not None:
+                enabled_check.setChecked(enabled_value)
+
+            self.signal_display_config.setdefault(key, {})
+            self.signal_display_config[key]["name"] = label_value
+            self.signal_display_config[key]["enabled"] = enabled_value
+
+            if persist:
+                self.settings.setValue(f"behavior_pin_{key}", self._format_pin_list(pins))
+                self.settings.setValue(f"behavior_role_{key}", role_value)
+                self.settings.setValue(f"behavior_signal_label_{key}", label_value)
+                self.settings.setValue(f"behavior_signal_enabled_{key}", int(enabled_value))
+
+        for line in range(1, 5):
+            value = str(line_labels.get(line, "None")) or "None"
+            combo = getattr(self, f"combo_line{line}_label", None)
+            if combo is not None:
+                combo.blockSignals(True)
+                if value in [combo.itemText(i) for i in range(combo.count())]:
+                    combo.setCurrentText(value)
+                else:
+                    combo.setCurrentText("None")
+                combo.blockSignals(False)
+                value = combo.currentText()
+            if persist:
+                self.settings.setValue(f"line_label_{line}", value)
+
+        if persist:
+            self.settings.sync()
+
+        if self.behavior_pin_edits:
+            self._apply_behavior_pin_configuration(persist=persist)
+        else:
+            self._refresh_pin_display_from_map({
+                key: [int(pin) for pin in signals.get(key, {}).get("pins", [])]
+                for key in self.BEHAVIOR_PIN_KEYS
+            })
+
+        self._apply_line_label_map_to_worker()
+
+    def _open_behavior_defaults_dialog(self):
+        """Open a popup to edit behavior/TTL defaults from General Settings."""
+        snapshot = self._behavior_defaults_snapshot()
+        line_options = ["None", "Gate", "Sync", "Barcode", "Lever", "Cue", "Reward", "ITI"]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Behavior / TTL Defaults")
+        dialog.resize(820, 760)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Define the default board pins and labels for the built-in Arduino/TTL channels. "
+            "If a GenICam camera is connected, you can also edit the camera line labels and allowed line modes/sources here."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #8fa6bf;")
+        layout.addWidget(intro)
+
+        summary_group = QGroupBox("Board Pin Defaults")
+        summary_layout = QFormLayout(summary_group)
+        summary_name_labels = {}
+        summary_value_labels = {}
+        for key in self.BEHAVIOR_PIN_KEYS:
+            name_label = QLabel("")
+            value_label = QLabel("")
+            summary_name_labels[key] = name_label
+            summary_value_labels[key] = value_label
+            summary_layout.addRow(name_label, value_label)
+        layout.addWidget(summary_group)
+
+        mapping_group = QGroupBox("Signal Mapping")
+        mapping_layout = QVBoxLayout(mapping_group)
+        mapping_grid = QGridLayout()
+        mapping_grid.setHorizontalSpacing(6)
+        mapping_grid.setVerticalSpacing(6)
+        mapping_grid.setColumnStretch(1, 2)
+        mapping_grid.setColumnStretch(2, 1)
+        mapping_grid.setColumnStretch(3, 1)
+        mapping_grid.addWidget(QLabel("Use"), 0, 0)
+        mapping_grid.addWidget(QLabel("Label"), 0, 1)
+        mapping_grid.addWidget(QLabel("Role"), 0, 2)
+        mapping_grid.addWidget(QLabel("Pins"), 0, 3)
+
+        dialog_enabled_checks = {}
+        dialog_label_edits = {}
+        dialog_role_boxes = {}
+        dialog_pin_edits = {}
+
+        def refresh_pin_summary():
+            for signal_key in self.BEHAVIOR_PIN_KEYS:
+                label_text = dialog_label_edits[signal_key].text().strip() or str(self.DISPLAY_SIGNAL_META[signal_key]["name"])
+                pin_text = dialog_pin_edits[signal_key].text().strip() or "-"
+                summary_name_labels[signal_key].setText(f"{label_text}:")
+                summary_value_labels[signal_key].setText(pin_text)
+
+        for row, key in enumerate(self.DISPLAY_SIGNAL_ORDER, start=1):
+            entry = snapshot["signals"][key]
+            enabled_check = QCheckBox()
+            enabled_check.setChecked(bool(entry.get("enabled", True)))
+
+            label_edit = QLineEdit(str(entry.get("label", self.DISPLAY_SIGNAL_META[key]["name"])))
+            label_edit.setPlaceholderText("Signal label")
+
+            role_box = QComboBox()
+            role_box.addItems(["Input", "Output"])
+            role_box.setCurrentText(str(entry.get("role", self.DISPLAY_SIGNAL_META[key]["role"])))
+
+            entry_pins = [int(pin) for pin in entry.get("pins", [])]
+            pin_edit = QLineEdit(self._format_pin_list(entry_pins) if entry_pins else "")
+            pin_edit.setPlaceholderText("e.g. 8, 9")
+
+            row_widgets = [label_edit, role_box, pin_edit]
+            for widget in row_widgets:
+                widget.setEnabled(enabled_check.isChecked())
+            enabled_check.toggled.connect(
+                lambda checked, widgets=row_widgets: [widget.setEnabled(checked) for widget in widgets]
+            )
+
+            label_edit.textChanged.connect(refresh_pin_summary)
+            pin_edit.textChanged.connect(refresh_pin_summary)
+
+            dialog_enabled_checks[key] = enabled_check
+            dialog_label_edits[key] = label_edit
+            dialog_role_boxes[key] = role_box
+            dialog_pin_edits[key] = pin_edit
+
+            mapping_grid.addWidget(enabled_check, row, 0, alignment=Qt.AlignCenter)
+            mapping_grid.addWidget(label_edit, row, 1)
+            mapping_grid.addWidget(role_box, row, 2)
+            mapping_grid.addWidget(pin_edit, row, 3)
+
+        mapping_layout.addLayout(mapping_grid)
+        mapping_note = QLabel(
+            "These rows correspond to the built-in hardware-backed Arduino/TTL channels. "
+            "Rename them freely, switch input/output roles, and use comma-separated pins for mirrored outputs such as barcode `18, 19`."
+        )
+        mapping_note.setWordWrap(True)
+        mapping_note.setStyleSheet("color: #8fa6bf;")
+        mapping_layout.addWidget(mapping_note)
+        layout.addWidget(mapping_group)
+
+        line_group = QGroupBox("Camera Inputs / Outputs")
+        line_layout = QGridLayout(line_group)
+        line_layout.setHorizontalSpacing(6)
+        line_layout.setVerticalSpacing(6)
+        line_layout.setColumnStretch(1, 2)
+        line_layout.setColumnStretch(2, 1)
+        line_layout.setColumnStretch(3, 1)
+        line_layout.addWidget(QLabel("Line"), 0, 0)
+        line_layout.addWidget(QLabel("Label"), 0, 1)
+        line_layout.addWidget(QLabel("Mode"), 0, 2)
+        line_layout.addWidget(QLabel("Source"), 0, 3)
+
+        dialog_line_entries = self._camera_line_entries_for_dialog()
+        dialog_line_controls = {}
+        line_choice_items = self._line_label_choice_list()
+
+        for row, entry in enumerate(dialog_line_entries, start=1):
+            selector_label = QLabel(str(entry.get("display_name", f"Line {row}")))
+
+            label_box = QComboBox()
+            label_box.setEditable(True)
+            label_box.addItems(line_choice_items)
+            label_box.setCurrentText(str(entry.get("label", "None")) or "None")
+
+            mode_box = QComboBox()
+            mode_options = [str(option) for option in entry.get("mode_options", []) if str(option).strip()]
+            if mode_options:
+                mode_box.addItems(mode_options)
+                current_mode = str(entry.get("mode", "")).strip()
+                if current_mode in mode_options:
+                    mode_box.setCurrentText(current_mode)
+            else:
+                mode_box.addItem("N/A")
+                mode_box.setEnabled(False)
+
+            source_box = QComboBox()
+            source_options = [str(option) for option in entry.get("source_options", []) if str(option).strip()]
+            if source_options:
+                source_box.addItems(source_options)
+                current_source = str(entry.get("source", "")).strip()
+                if current_source in source_options:
+                    source_box.setCurrentText(current_source)
+            else:
+                source_box.addItem("N/A")
+                source_box.setEnabled(False)
+
+            if not bool(entry.get("live", False)):
+                mode_box.setEnabled(False)
+                source_box.setEnabled(False)
+
+            def sync_source_enabled(mode_widget=mode_box, source_widget=source_box, options=source_options):
+                if not options:
+                    source_widget.setEnabled(False)
+                    return
+                mode_value = mode_widget.currentText().strip().lower()
+                source_widget.setEnabled(mode_value == "output")
+
+            mode_box.currentTextChanged.connect(sync_source_enabled)
+            sync_source_enabled()
+
+            dialog_line_controls[str(entry.get("selector", f"Line{row}"))] = {
+                "entry": entry,
+                "label": label_box,
+                "mode": mode_box,
+                "source": source_box,
+            }
+
+            line_layout.addWidget(selector_label, row, 0)
+            line_layout.addWidget(label_box, row, 1)
+            line_layout.addWidget(mode_box, row, 2)
+            line_layout.addWidget(source_box, row, 3)
+
+        line_note = QLabel(
+            "Mode/source controls are enabled only when a compatible Basler or FLIR GenICam camera is connected. "
+            "Label fields stay editable so export column names can still be customized."
+        )
+        line_note.setWordWrap(True)
+        line_note.setStyleSheet("color: #8fa6bf;")
+        line_layout.addWidget(line_note, len(dialog_line_entries) + 1, 0, 1, 4)
+        layout.addWidget(line_group)
+
+        action_row = QHBoxLayout()
+        btn_restore = QPushButton("Restore App Defaults")
+        self._set_button_icon(btn_restore, "import", "#33d5ff", "ghostButton")
+        action_row.addWidget(btn_restore)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def apply_snapshot_to_dialog(dialog_snapshot: Dict[str, Dict]):
+            for signal_key in self.DISPLAY_SIGNAL_ORDER:
+                entry = dialog_snapshot["signals"][signal_key]
+                dialog_enabled_checks[signal_key].setChecked(bool(entry.get("enabled", True)))
+                dialog_label_edits[signal_key].setText(
+                    str(entry.get("label", self.DISPLAY_SIGNAL_META[signal_key]["name"]))
+                )
+                role_value = str(entry.get("role", self.DISPLAY_SIGNAL_META[signal_key]["role"]))
+                role_box = dialog_role_boxes[signal_key]
+                role_box.blockSignals(True)
+                if role_value in [role_box.itemText(i) for i in range(role_box.count())]:
+                    role_box.setCurrentText(role_value)
+                role_box.blockSignals(False)
+                entry_pins = [int(pin) for pin in entry.get("pins", [])]
+                dialog_pin_edits[signal_key].setText(self._format_pin_list(entry_pins) if entry_pins else "")
+
+            for line_entry in dialog_line_entries:
+                selector = str(line_entry.get("selector", ""))
+                control = dialog_line_controls.get(selector)
+                if control is None:
+                    continue
+                line_number = int(line_entry.get("line_number", 0))
+                value = str(dialog_snapshot["line_labels"].get(line_number, "None"))
+                control["label"].blockSignals(True)
+                control["label"].setCurrentText(value if value else "None")
+                control["label"].blockSignals(False)
+
+            refresh_pin_summary()
+
+        def restore_dialog_defaults():
+            apply_snapshot_to_dialog(self._factory_behavior_defaults_snapshot())
+            for line_entry in dialog_line_entries:
+                selector = str(line_entry.get("selector", ""))
+                control = dialog_line_controls.get(selector)
+                if control is None:
+                    continue
+                entry = control["entry"]
+                mode_options = [control["mode"].itemText(i) for i in range(control["mode"].count())]
+                source_options = [control["source"].itemText(i) for i in range(control["source"].count())]
+                default_mode = str(entry.get("mode", "")).strip()
+                default_source = str(entry.get("source", "")).strip()
+                if control["mode"].isEnabled() and default_mode in mode_options:
+                    control["mode"].setCurrentText(default_mode)
+                if control["source"].isEnabled() and default_source in source_options:
+                    control["source"].setCurrentText(default_source)
+
+        btn_restore.clicked.connect(restore_dialog_defaults)
+        apply_snapshot_to_dialog(snapshot)
+
+        while True:
+            if dialog.exec() != QDialog.Accepted:
+                return
+
+            updated_snapshot = {"signals": {}, "line_labels": {}}
+            try:
+                for key in self.DISPLAY_SIGNAL_ORDER:
+                    label_value = dialog_label_edits[key].text().strip() or str(self.DISPLAY_SIGNAL_META[key]["name"])
+                    role_value = dialog_role_boxes[key].currentText()
+                    pins = self._parse_pin_text(dialog_pin_edits[key].text())
+                    if not pins:
+                        pins = self._default_behavior_pin_map().get(key, []).copy()
+                    updated_snapshot["signals"][key] = {
+                        "enabled": bool(dialog_enabled_checks[key].isChecked()),
+                        "label": label_value,
+                        "role": role_value,
+                        "pins": pins,
+                    }
+
+                line_defaults = {}
+                for line_entry in dialog_line_entries:
+                    selector = str(line_entry.get("selector", ""))
+                    control = dialog_line_controls.get(selector)
+                    if control is None:
+                        continue
+                    line_number = int(line_entry.get("line_number", 0))
+                    label_value = str(control["label"].currentText()).strip() or "None"
+                    updated_snapshot["line_labels"][line_number] = label_value
+                    line_defaults[selector] = {
+                        "label": label_value,
+                        "mode": str(control["mode"].currentText()).strip() if control["mode"].isEnabled() else "",
+                        "source": str(control["source"].currentText()).strip() if control["source"].isEnabled() else "",
+                    }
+            except Exception as exc:
+                self._on_error_occurred(f"Invalid behavior default configuration: {str(exc)}")
+                continue
+
+            self._save_camera_line_defaults(line_defaults)
+            self._apply_behavior_defaults_snapshot(updated_snapshot, persist=True)
+            self._refresh_line_label_combo_options()
+            if self.is_camera_connected:
+                self._apply_saved_camera_line_defaults()
+            self._on_status_update("Behavior and camera line defaults updated")
+            return
+
     def _current_behavior_pin_map(self) -> Dict[str, List[int]]:
         """Read current behavior pin mapping from UI edits."""
         pin_map = {}
@@ -2340,6 +3062,8 @@ class MainWindow(QMainWindow):
         if self.arduino_worker:
             self.arduino_worker.set_manual_pin_config(pin_map)
             self.arduino_worker.set_signal_roles(role_map)
+
+        self._refresh_line_label_combo_options()
 
     def _load_behavior_panel_settings(self):
         """Load saved behavior pin and role settings."""
@@ -2444,6 +3168,20 @@ class MainWindow(QMainWindow):
                 "interval_s": float(self.settings.value("barcode_interval_s", 5.0)),
             }
 
+        barcode_pins = self._current_barcode_output_pins()
+        worker_pins = params.get("output_pins", [])
+        if not barcode_pins and isinstance(worker_pins, list):
+            barcode_pins = [int(pin) for pin in worker_pins if str(pin).strip()]
+        if not barcode_pins:
+            barcode_pins = self._default_behavior_pin_map().get("barcode", [18]).copy()
+
+        primary_pin = int(barcode_pins[0])
+        saved_mirror_pin = int(self.settings.value("barcode_mirror_pin", -1))
+        mirror_enabled = len(barcode_pins) > 1 or int(self.settings.value("barcode_mirror_enabled", 0)) == 1
+        mirror_pin = int(barcode_pins[1]) if len(barcode_pins) > 1 else (
+            saved_mirror_pin if saved_mirror_pin >= 0 and saved_mirror_pin != primary_pin else primary_pin + 1
+        )
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Barcode Parameters")
         form = QFormLayout(dialog)
@@ -2481,6 +3219,27 @@ class MainWindow(QMainWindow):
         spin_interval.setValue(float(params.get("interval_s", 5.0)))
         form.addRow("Gap After Code:", spin_interval)
 
+        spin_primary_pin = QSpinBox()
+        spin_primary_pin.setRange(0, 99)
+        spin_primary_pin.setValue(primary_pin)
+        form.addRow("Primary Output Pin:", spin_primary_pin)
+
+        check_mirror_pin = QCheckBox("Drive the same barcode on a second output pin")
+        check_mirror_pin.setChecked(bool(mirror_enabled))
+        form.addRow("Mirror Output:", check_mirror_pin)
+
+        spin_mirror_pin = QSpinBox()
+        spin_mirror_pin.setRange(0, 99)
+        spin_mirror_pin.setValue(max(0, mirror_pin))
+        spin_mirror_pin.setEnabled(check_mirror_pin.isChecked())
+        check_mirror_pin.toggled.connect(spin_mirror_pin.setEnabled)
+        form.addRow("Mirror Pin:", spin_mirror_pin)
+
+        mirror_note = QLabel("Primary and mirror outputs carry the same barcode waveform.")
+        mirror_note.setWordWrap(True)
+        mirror_note.setStyleSheet("color: #8fa6bf;")
+        form.addRow("", mirror_note)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -2494,8 +3253,15 @@ class MainWindow(QMainWindow):
         start_lo_val = float(spin_start_lo.value())
         bit_val = float(spin_bit.value())
         interval_val = float(spin_interval.value())
+        primary_pin_val = int(spin_primary_pin.value())
+        mirror_enabled = bool(check_mirror_pin.isChecked())
+        mirror_pin_val = int(spin_mirror_pin.value())
         word_duration = start_hi_val + start_lo_val + (bits_val * bit_val)
         cycle_duration = word_duration + interval_val
+
+        if mirror_enabled and mirror_pin_val == primary_pin_val:
+            self._on_error_occurred("Mirror pin must be different from the primary barcode output pin.")
+            return
 
         if self.arduino_worker:
             self.arduino_worker.set_barcode_parameters(
@@ -2512,11 +3278,17 @@ class MainWindow(QMainWindow):
             self.settings.setValue("barcode_bit_s", bit_val)
             self.settings.setValue("barcode_interval_s", interval_val)
 
+        barcode_pins = [primary_pin_val]
+        if mirror_enabled:
+            barcode_pins.append(mirror_pin_val)
+        self._apply_barcode_output_pins(barcode_pins, persist=True)
+
         self._on_status_update(
             "Barcode params updated: "
             f"bits={bits_val}, start={start_hi_val:.3f}/{start_lo_val:.3f}s, "
             f"bit={bit_val:.3f}s, gap={interval_val:.3f}s, "
-            f"word={word_duration:.3f}s, cycle={cycle_duration:.3f}s"
+            f"word={word_duration:.3f}s, cycle={cycle_duration:.3f}s, "
+            f"pins={self._format_pin_list(barcode_pins)}"
         )
 
     def _setup_worker(self):
@@ -2535,6 +3307,17 @@ class MainWindow(QMainWindow):
         # Connect frame recording to TTL sampling (sync TTLs with camera frames)
         self.worker.frame_recorded.connect(self._on_frame_recorded)
         self._apply_line_label_map_to_worker()
+        self._apply_pipeline_settings_to_worker()
+
+    def _apply_pipeline_settings_to_worker(self):
+        """Push preview and buffering preferences into the camera worker."""
+        if not self.worker:
+            return
+        self.worker.set_preview_enabled(self.check_preview_enabled.isChecked())
+        self.worker.set_preview_fps(self.spin_preview_fps.value())
+        self.worker.set_preview_max_width(self.spin_preview_width.value())
+        self.worker.set_frame_buffer_size(self.spin_frame_buffer.value())
+        self.worker.set_metadata_stats_interval(self.spin_metadata_stats_interval.value())
 
     def _get_max_record_seconds(self) -> int:
         """Return the configured recording limit in seconds, or 0 if unlimited/disabled."""
@@ -2550,13 +3333,90 @@ class MainWindow(QMainWindow):
         """
         Convert the configured max duration into an exact frame target.
 
-        Using a frame target avoids short recordings when the camera reports a
-        slightly different real FPS than the requested output FPS.
+        The target uses the worker's effective recording FPS so FLIR recordings
+        stay aligned with the actual encoded video length.
         """
         max_seconds = self._get_max_record_seconds()
         if max_seconds <= 0:
             return None
-        return max(1, int(round(float(self.spin_fps.value()) * max_seconds)))
+        return max(1, int(round(self._get_recording_reference_fps() * max_seconds)))
+
+    def _get_recording_reference_fps(self) -> float:
+        """Return the FPS used for recording duration math."""
+        if self.worker is not None:
+            worker_fps_candidates = []
+            recording_output_fps = getattr(self.worker, "recording_output_fps", None)
+            if self.worker.is_recording and recording_output_fps:
+                worker_fps_candidates.append(recording_output_fps)
+            worker_fps_candidates.extend([
+                getattr(self.worker, "camera_reported_fps", None),
+                getattr(self.worker, "fps_target", None),
+            ])
+            for candidate in worker_fps_candidates:
+                try:
+                    fps_value = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if fps_value > 0:
+                    return fps_value
+        return max(1.0, float(self.spin_fps.value()))
+
+    def _active_planner_row_index(self) -> Optional[int]:
+        """Return the selected planner row when available, otherwise the active row."""
+        if self.planner_table is not None and self.planner_table.selectionModel() is not None:
+            selected_rows = self.planner_table.selectionModel().selectedRows()
+            if selected_rows:
+                return selected_rows[0].row()
+        if self.active_planner_row is None:
+            return None
+        if self.planner_table is None:
+            return None
+        if 0 <= self.active_planner_row < self.planner_table.rowCount():
+            return self.active_planner_row
+        return None
+
+    def _sync_active_trial_duration_cell(self):
+        """Mirror the current recording-length controls into the active planner row."""
+        if self.planner_table is None:
+            return
+        row = self._active_planner_row_index()
+        if row is None:
+            return
+        duration_seconds = self._get_max_record_seconds()
+        duration_text = str(duration_seconds if duration_seconds > 0 else 0)
+        headers = self._planner_headers()
+        if "Duration (s)" not in headers:
+            return
+        duration_column = headers.index("Duration (s)")
+        item = self.planner_table.item(row, duration_column)
+        if item is not None and item.text().strip() == duration_text:
+            return
+        self.planner_table.blockSignals(True)
+        self._set_planner_cell(row, "Duration (s)", duration_text)
+        self.planner_table.blockSignals(False)
+        self._update_planner_summary()
+
+    def _apply_recording_frame_limit(self):
+        """Push the configured recording cap into the worker immediately."""
+        if self.worker is None:
+            return
+        target_frames = self._get_target_record_frames()
+        self.worker.set_recording_frame_limit(target_frames)
+
+    def _update_recording_limit_inputs_enabled(self):
+        """Disable duration spin boxes when unlimited recording is selected."""
+        limited = self.check_unlimited.currentText() == "Limited"
+        for widget in (self.spin_hours, self.spin_minutes, self.spin_seconds):
+            widget.setEnabled(limited)
+
+    def _on_recording_length_controls_changed(self, *_args):
+        """Keep UI, planner state, and active worker limits aligned."""
+        self._update_recording_limit_inputs_enabled()
+        self._sync_active_trial_duration_cell()
+        self._apply_recording_frame_limit()
+        self._refresh_recording_session_summary()
+        if self.recording_start_time:
+            self._update_recording_time()
 
     def _setup_arduino_worker(self):
         """
@@ -2598,10 +3458,16 @@ class MainWindow(QMainWindow):
 
         flir_cameras, reserved_usb_indices = discover_flir_cameras()
         usb_cameras = discover_usb_cameras(skip_indices=reserved_usb_indices)
+        backend_diagnostics = get_camera_backend_diagnostics()
 
         for camera_info in basler_cameras + flir_cameras + usb_cameras:
             self.combo_camera.addItem(camera_info.get("label", "Camera"), camera_info)
             cameras.append(camera_info)
+
+        if not any(cam.get("backend") == "spinnaker" for cam in flir_cameras):
+            pyspin_diag = backend_diagnostics.get("pyspin", "")
+            if pyspin_diag and hasattr(self, "status_bar"):
+                self._on_status_update(f"FLIR Spinnaker unavailable: {pyspin_diag}")
 
         if not cameras:
             self.combo_camera.addItem("No cameras detected", None)
@@ -2758,7 +3624,51 @@ class MainWindow(QMainWindow):
                 cleaned.append("_")
         return "".join(cleaned).strip("_")
 
-    def _compose_recording_basename(self) -> str:
+    def _set_filename_field_text(self, text: str):
+        """Update the filename field without treating it as a user edit."""
+        if not hasattr(self, "edit_filename") or self.edit_filename is None:
+            return
+        self._filename_field_syncing = True
+        try:
+            self.edit_filename.setText(text)
+        finally:
+            self._filename_field_syncing = False
+
+    def _save_recording_form_state(self):
+        """Persist the last recording-form values so they survive app relaunches."""
+        if self.meta_animal_id is not None:
+            self.settings.setValue("recording_meta_animal_id", self.meta_animal_id.text().strip())
+        if self.meta_trial is not None:
+            self.settings.setValue("recording_meta_trial", self.meta_trial.text().strip())
+        if hasattr(self, "meta_experiment") and self.meta_experiment is not None:
+            self.settings.setValue("recording_meta_experiment", self.meta_experiment.text().strip())
+        if self.meta_condition is not None:
+            self.settings.setValue("recording_meta_condition", self.meta_condition.text().strip())
+        if self.meta_arena is not None:
+            self.settings.setValue("recording_meta_arena", self.meta_arena.text().strip())
+        if hasattr(self, "meta_notes") and self.meta_notes is not None:
+            self.settings.setValue("recording_meta_notes", self.meta_notes.toPlainText())
+        self.settings.setValue("recording_filename_override", self._custom_filename_override)
+
+    def _load_recording_form_state(self):
+        """Restore the last recording-form values from settings."""
+        if self.meta_animal_id is not None:
+            self.meta_animal_id.setText(str(self.settings.value("recording_meta_animal_id", "")))
+        if self.meta_trial is not None:
+            self.meta_trial.setText(str(self.settings.value("recording_meta_trial", "")))
+        if hasattr(self, "meta_experiment") and self.meta_experiment is not None:
+            self.meta_experiment.setText(str(self.settings.value("recording_meta_experiment", "")))
+        if self.meta_condition is not None:
+            self.meta_condition.setText(str(self.settings.value("recording_meta_condition", "")))
+        if self.meta_arena is not None:
+            saved_arena = str(self.settings.value("recording_meta_arena", self.meta_arena.text().strip() or "Arena 1"))
+            self.meta_arena.setText(saved_arena or "Arena 1")
+        if hasattr(self, "meta_notes") and self.meta_notes is not None:
+            self.meta_notes.setPlainText(str(self.settings.value("recording_meta_notes", "")))
+
+        self._custom_filename_override = str(self.settings.value("recording_filename_override", "") or "").strip()
+
+    def _compose_generated_recording_basename(self) -> str:
         values = self._metadata_token_values()
         ordered_parts = []
         for key in self._selected_filename_order():
@@ -2773,17 +3683,55 @@ class MainWindow(QMainWindow):
             return "_".join(ordered_parts)
         return f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+    def _current_custom_filename_override(self) -> str:
+        """Return the sanitized custom filename override, if the user set one."""
+        raw_override = self._custom_filename_override
+        if hasattr(self, "edit_filename") and self.edit_filename is not None and self.edit_filename.hasFocus():
+            raw_override = self.edit_filename.text()
+        return self._sanitize_filename_part(str(raw_override))
+
+    def _compose_recording_basename(self) -> str:
+        custom_override = self._current_custom_filename_override()
+        if custom_override:
+            return custom_override
+        return self._compose_generated_recording_basename()
+
+    def _on_filename_text_edited(self, text: str):
+        """Persist a user-entered filename override without losing edit focus."""
+        if self._filename_field_syncing:
+            return
+        self._custom_filename_override = str(text)
+        self._save_recording_form_state()
+        self._refresh_recording_session_summary()
+
+    def _on_filename_editing_finished(self):
+        """Normalize the filename override after the user leaves the field."""
+        if self._filename_field_syncing or not hasattr(self, "edit_filename") or self.edit_filename is None:
+            return
+        self._custom_filename_override = self._sanitize_filename_part(self.edit_filename.text())
+        self._save_recording_form_state()
+        self._update_filename_preview()
+
     def _update_filename_preview(self, *_args):
         """Refresh the generated filename preview and formula label."""
+        generated_basename = self._compose_generated_recording_basename()
         basename = self._compose_recording_basename()
         if hasattr(self, "edit_filename") and self.edit_filename is not None:
-            self.edit_filename.setText(basename)
+            if not self.edit_filename.hasFocus():
+                self._set_filename_field_text(basename)
         if hasattr(self, "label_filename_formula") and self.label_filename_formula is not None:
-            readable = " / ".join(
-                self._filename_key_to_label(key)
-                for key in self._selected_filename_order()
-            ) or "No filename parts selected"
-            self.label_filename_formula.setText(f"{readable}\nPreview: {basename}")
+            custom_override = self._current_custom_filename_override()
+            if custom_override:
+                self.label_filename_formula.setText(
+                    f"Custom filename override\nGenerated fallback: {generated_basename}\nPreview: {basename}"
+                )
+            else:
+                readable = " / ".join(
+                    self._filename_key_to_label(key)
+                    for key in self._selected_filename_order()
+                ) or "No filename parts selected"
+                self.label_filename_formula.setText(f"{readable}\nPreview: {basename}")
+        self._save_recording_form_state()
         self._refresh_recording_session_summary()
 
     def _planner_status_style(self, status: str):
@@ -2857,6 +3805,9 @@ class MainWindow(QMainWindow):
                 + int(self.settings.value("max_minutes", 5)) * 60
                 + int(self.settings.value("max_seconds", 0))
             )
+        if hasattr(self, "check_unlimited") and self.check_unlimited is not None:
+            if self.check_unlimited.currentText() != "Limited":
+                return 0
         return (
             int(self.spin_hours.value()) * 3600
             + int(self.spin_minutes.value()) * 60
@@ -2917,14 +3868,16 @@ class MainWindow(QMainWindow):
         condition = payload.get("Condition", "").strip() or "No condition"
         arena = payload.get("Arena", "").strip() or "No arena"
         filename = self.edit_filename.text().strip() if hasattr(self, "edit_filename") and self.edit_filename is not None else ""
+        max_length_seconds = self._get_max_record_seconds()
+        max_length_text = "Unlimited" if max_length_seconds <= 0 else self._format_duration_hms(max_length_seconds)
         self.label_recording_plan_summary.setText(f"{status}  |  Trial {trial}  |  {animal}")
         if filename:
             self.label_recording_plan_details.setText(
-                f"{experiment}  |  {condition}  |  {arena}\nNext file: {filename}"
+                f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}\nNext file: {filename}"
             )
         else:
             self.label_recording_plan_details.setText(
-                f"{experiment}  |  {condition}  |  {arena}"
+                f"{experiment}  |  {condition}  |  {arena}  |  Max {max_length_text}"
             )
 
     def _refresh_planner_columns(self):
@@ -3196,6 +4149,8 @@ class MainWindow(QMainWindow):
                 self.spin_hours.setValue(duration_seconds // 3600)
                 self.spin_minutes.setValue((duration_seconds % 3600) // 60)
                 self.spin_seconds.setValue(duration_seconds % 60)
+            else:
+                self.check_unlimited.setCurrentText("Unlimited")
         except Exception:
             pass
 
@@ -3286,6 +4241,26 @@ class MainWindow(QMainWindow):
         if 0 <= encoder_index < self.combo_encoder.count():
             self.combo_encoder.setCurrentIndex(encoder_index)
 
+        self.check_preview_enabled.blockSignals(True)
+        self.check_preview_enabled.setChecked(int(self.settings.value('preview_enabled', 1)) == 1)
+        self.check_preview_enabled.blockSignals(False)
+
+        self.spin_preview_fps.blockSignals(True)
+        self.spin_preview_fps.setValue(float(self.settings.value('preview_fps', 25.0)))
+        self.spin_preview_fps.blockSignals(False)
+
+        self.spin_preview_width.blockSignals(True)
+        self.spin_preview_width.setValue(int(self.settings.value('preview_width', 1280)))
+        self.spin_preview_width.blockSignals(False)
+
+        self.spin_frame_buffer.blockSignals(True)
+        self.spin_frame_buffer.setValue(int(self.settings.value('frame_buffer_size', 128)))
+        self.spin_frame_buffer.blockSignals(False)
+
+        self.spin_metadata_stats_interval.blockSignals(True)
+        self.spin_metadata_stats_interval.setValue(int(self.settings.value('metadata_stats_interval', 25)))
+        self.spin_metadata_stats_interval.blockSignals(False)
+
         self.spin_hours.setValue(int(self.settings.value('max_hours', 0)))
         self.spin_minutes.setValue(int(self.settings.value('max_minutes', 5)))
         self.spin_seconds.setValue(int(self.settings.value('max_seconds', 0)))
@@ -3299,6 +4274,7 @@ class MainWindow(QMainWindow):
 
         self._load_line_label_settings()
         self._load_behavior_panel_settings()
+        self._load_recording_form_state()
         self._set_filename_order_controls()
 
         metadata_visible = int(self.settings.value("metadata_panel_visible", 1))
@@ -3315,12 +4291,19 @@ class MainWindow(QMainWindow):
         self.spin_height.valueChanged.connect(lambda v: self._save_ui_setting('camera_height', v))
         self.combo_encoder.currentIndexChanged.connect(lambda v: self._save_ui_setting('encoder_index', v))
         self.combo_image_format.currentTextChanged.connect(lambda v: self._save_ui_setting('image_format', v))
+        self.check_preview_enabled.toggled.connect(lambda v: self._save_ui_setting('preview_enabled', 1 if v else 0))
+        self.spin_preview_fps.valueChanged.connect(lambda v: self._save_ui_setting('preview_fps', v))
+        self.spin_preview_width.valueChanged.connect(lambda v: self._save_ui_setting('preview_width', v))
+        self.spin_frame_buffer.valueChanged.connect(lambda v: self._save_ui_setting('frame_buffer_size', v))
+        self.spin_metadata_stats_interval.valueChanged.connect(lambda v: self._save_ui_setting('metadata_stats_interval', v))
         self.spin_hours.valueChanged.connect(lambda v: self._save_ui_setting('max_hours', v))
         self.spin_minutes.valueChanged.connect(lambda v: self._save_ui_setting('max_minutes', v))
         self.spin_seconds.valueChanged.connect(lambda v: self._save_ui_setting('max_seconds', v))
         self.check_unlimited.currentIndexChanged.connect(lambda v: self._save_ui_setting('max_unlimited', 1 if v == 1 else 0))
         self._update_filename_preview()
         self._update_planner_summary()
+        self._on_recording_length_controls_changed()
+        self._update_preview_control_state()
 
     @Slot()
     def _toggle_metadata_panel(self):
@@ -3335,16 +4318,14 @@ class MainWindow(QMainWindow):
             3: self.settings.value('line_label_3', 'None'),
             4: self.settings.value('line_label_4', 'None'),
         }
+        self._refresh_line_label_combo_options()
         for line, value in label_defaults.items():
             combo = getattr(self, f"combo_line{line}_label", None)
             if not combo:
                 continue
             value = "Sync" if str(value) == "TTL 1Hz" else str(value)
             combo.blockSignals(True)
-            if value in [combo.itemText(i) for i in range(combo.count())]:
-                combo.setCurrentText(value)
-            else:
-                combo.setCurrentText("None")
+            combo.setCurrentText(value if value else "None")
             combo.blockSignals(False)
 
         self._apply_line_label_map_to_worker()
@@ -3353,9 +4334,186 @@ class MainWindow(QMainWindow):
         """Persist a UI setting."""
         self.settings.setValue(key, value)
 
+    def _line_label_choice_list(self) -> List[str]:
+        """Return suggested editable labels for camera line assignments."""
+        choices = ["None"]
+        seen = {"none"}
+
+        for key in self.DISPLAY_SIGNAL_ORDER:
+            label = self._signal_label(key).strip()
+            lowered = label.lower()
+            if label and lowered not in seen:
+                choices.append(label)
+                seen.add(lowered)
+
+        for line in range(1, 5):
+            saved = str(self.settings.value(f"line_label_{line}", "None")).strip()
+            lowered = saved.lower()
+            if saved and lowered not in seen:
+                choices.append(saved)
+                seen.add(lowered)
+
+        raw_catalog = str(self.settings.value("camera_line_label_catalog", "") or "")
+        for token in [value.strip() for value in raw_catalog.split("|")]:
+            lowered = token.lower()
+            if token and lowered not in seen:
+                choices.append(token)
+                seen.add(lowered)
+
+        return choices
+
+    def _refresh_line_label_combo_options(self):
+        """Refresh editable line-label suggestions without losing current values."""
+        choices = self._line_label_choice_list()
+        for line in range(1, 5):
+            combo = getattr(self, f"combo_line{line}_label", None)
+            if combo is None:
+                continue
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(choices)
+            combo.setCurrentText(current if current else "None")
+            combo.blockSignals(False)
+
+    def _load_camera_line_defaults(self) -> Dict[str, Dict[str, str]]:
+        """Load persisted line-mode/source defaults keyed by camera selector name."""
+        raw_value = str(self.settings.value("camera_line_defaults_json", "") or "").strip()
+        if not raw_value:
+            return {}
+        try:
+            payload = json.loads(raw_value)
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        normalized: Dict[str, Dict[str, str]] = {}
+        for selector, config in payload.items():
+            if not isinstance(config, dict):
+                continue
+            normalized[str(selector)] = {
+                "label": str(config.get("label", "")).strip(),
+                "mode": str(config.get("mode", "")).strip(),
+                "source": str(config.get("source", "")).strip(),
+            }
+        return normalized
+
+    def _save_camera_line_defaults(self, line_defaults: Dict[str, Dict[str, str]]):
+        """Persist line defaults and keep the editable label catalog in sync."""
+        serializable = {}
+        label_catalog = set()
+        for selector, config in (line_defaults or {}).items():
+            selector_name = str(selector).strip()
+            if not selector_name or not isinstance(config, dict):
+                continue
+            label = str(config.get("label", "")).strip()
+            mode = str(config.get("mode", "")).strip()
+            source = str(config.get("source", "")).strip()
+            serializable[selector_name] = {"label": label, "mode": mode, "source": source}
+            if label:
+                label_catalog.add(label)
+
+        self.settings.setValue("camera_line_defaults_json", json.dumps(serializable))
+        self.settings.setValue("camera_line_label_catalog", "|".join(sorted(label_catalog, key=str.lower)))
+
+    def _update_line_label_catalog_from_ui(self):
+        """Persist custom line-label suggestions from the current UI selections."""
+        catalog = set()
+        for line in range(1, 5):
+            combo = getattr(self, f"combo_line{line}_label", None)
+            if combo is None:
+                continue
+            value = combo.currentText().strip()
+            if value and value.lower() != "none":
+                catalog.add(value)
+
+        raw_catalog = str(self.settings.value("camera_line_label_catalog", "") or "")
+        for token in [value.strip() for value in raw_catalog.split("|")]:
+            if token and token.lower() != "none":
+                catalog.add(token)
+
+        self.settings.setValue("camera_line_label_catalog", "|".join(sorted(catalog, key=str.lower)))
+
+    def _camera_line_entries_for_dialog(self) -> List[Dict[str, object]]:
+        """Build camera-line rows for the defaults dialog from live camera capabilities when available."""
+        saved_defaults = self._load_camera_line_defaults()
+        live_capabilities = []
+        if self.worker is not None and self.is_camera_connected and self.worker.is_genicam_camera():
+            try:
+                live_capabilities = self.worker.get_camera_line_capabilities()
+            except Exception:
+                live_capabilities = []
+
+        entries: List[Dict[str, object]] = []
+        if live_capabilities:
+            for index, capability in enumerate(live_capabilities[:4], start=1):
+                selector = str(capability.get("selector", f"Line{index}"))
+                saved = saved_defaults.get(selector, {})
+                entries.append({
+                    "selector": selector,
+                    "display_name": selector,
+                    "label": str(saved.get("label", "")).strip() or str(self.settings.value(f"line_label_{index}", "None")),
+                    "mode": str(saved.get("mode", "")).strip() or str(capability.get("mode", "")).strip(),
+                    "mode_options": [str(value) for value in capability.get("mode_options", []) if str(value).strip()],
+                    "source": str(saved.get("source", "")).strip() or str(capability.get("source", "")).strip(),
+                    "source_options": [str(value) for value in capability.get("source_options", []) if str(value).strip()],
+                    "live": True,
+                    "line_number": index,
+                })
+            return entries
+
+        for index in range(1, 5):
+            entries.append({
+                "selector": f"Line{index}",
+                "display_name": f"Line {index}",
+                "label": str(self.settings.value(f"line_label_{index}", "None")),
+                "mode": "",
+                "mode_options": [],
+                "source": "",
+                "source_options": [],
+                "live": False,
+                "line_number": index,
+            })
+        return entries
+
+    def _apply_saved_camera_line_defaults(self):
+        """Apply persisted line-mode/source defaults to the connected GenICam camera."""
+        if self.worker is None or not self.is_camera_connected or not self.worker.is_genicam_camera():
+            return
+
+        saved_defaults = self._load_camera_line_defaults()
+        if not saved_defaults:
+            return
+
+        capabilities = self.worker.get_camera_line_capabilities()
+        pending_configs = []
+        for capability in capabilities[:4]:
+            selector = str(capability.get("selector", "")).strip()
+            if not selector:
+                continue
+            saved = saved_defaults.get(selector, {})
+            mode = str(saved.get("mode", "")).strip()
+            source = str(saved.get("source", "")).strip()
+            config = {"selector": selector}
+            include = False
+            if mode and mode in capability.get("mode_options", []):
+                config["mode"] = mode
+                include = True
+            if source and source in capability.get("source_options", []):
+                config["source"] = source
+                include = True
+            if include:
+                pending_configs.append(config)
+
+        if pending_configs:
+            self.worker.apply_camera_line_configuration(pending_configs)
+
     def _on_line_label_changed(self, line_number: int, value: str):
         """Handle camera input label changes."""
-        self._save_ui_setting(f'line_label_{line_number}', value)
+        normalized = str(value).strip() or "None"
+        self._save_ui_setting(f'line_label_{line_number}', normalized)
+        self._update_line_label_catalog_from_ui()
         self._apply_line_label_map_to_worker()
 
     def _apply_line_label_map_to_worker(self):
@@ -3377,21 +4535,12 @@ class MainWindow(QMainWindow):
         return label_map
 
     def _line_label_suffix(self, label: str) -> str:
-        if label == "Gate":
-            return "gate"
-        if label in ("TTL 1Hz", "Sync"):
-            return "ttl_1hz"
-        if label == "Barcode":
-            return "barcode"
-        if label == "Lever":
-            return "lever"
-        if label == "Cue":
-            return "cue"
-        if label == "Reward":
-            return "reward"
-        if label == "ITI":
-            return "iti"
-        return ""
+        text = str(label).strip()
+        if not text or text.lower() == "none":
+            return ""
+        if text == "TTL 1Hz":
+            text = "Sync"
+        return self._slugify_export_label(text, "line")
 
     def _apply_line_label_suffixes(self, df):
         """Rename line status columns with selected suffixes."""
@@ -3559,12 +4708,18 @@ class MainWindow(QMainWindow):
                 )
 
                 # Apply initial settings
-                if camera_info.get('type') == "basler":
-                    self._enable_basler_frame_rate()
                 self._on_fps_changed(self.spin_fps.value())
                 self._on_exposure_changed(self.spin_exposure.value())
                 self._on_resolution_changed()
+                if (
+                    camera_info.get('backend') == "spinnaker"
+                    and self.worker is not None
+                    and getattr(self.worker, "spinnaker_is_color", False)
+                    and self.combo_image_format.currentText() != "BGR8"
+                ):
+                    self.combo_image_format.setCurrentText("BGR8")
                 self._on_image_format_changed(self.combo_image_format.currentText())
+                self._apply_saved_camera_line_defaults()
 
                 # Start the worker thread
                 self.worker.start()
@@ -3659,7 +4814,7 @@ class MainWindow(QMainWindow):
                 encoder = "h264_nvenc"
 
             self.worker.set_encoder(encoder)
-            self.worker.set_recording_frame_limit(self._get_target_record_frames())
+            self.worker.set_recording_frame_limit(None)
             self._reset_frame_drop_display(recording_active=True)
 
             if self.is_arduino_connected:
@@ -3682,6 +4837,8 @@ class MainWindow(QMainWindow):
                 self._sync_active_trial_status("Pending")
                 self.current_recording_filepath = None
                 return
+
+            self._apply_recording_frame_limit()
 
             self.recording_start_time = datetime.now()
             self.recording_timer.start(1000)
@@ -3800,29 +4957,49 @@ class MainWindow(QMainWindow):
         """Handle FPS change."""
         if not self.worker:
             return
+        actual_fps = None
+        actual_exposure_ms = None
+        throughput_suffix = ""
         try:
-            if self.worker.camera_type == "usb" and self.worker.usb_capture:
-                self.worker.usb_capture.set(cv2.CAP_PROP_FPS, float(value))
-                self.worker.set_target_fps(value)
-                actual_fps = self.worker.sync_camera_fps()
-            elif self.worker.camera_type == "flir" and self.worker.flir_camera:
+            if self.worker.camera_type == "flir" and self.worker.flir_camera:
                 flir_cap = getattr(self.worker.flir_camera, "cap", None)
                 if flir_cap is not None:
                     flir_cap.set(cv2.CAP_PROP_FPS, float(value))
-                self.worker.set_target_fps(value)
-                actual_fps = self.worker.sync_camera_fps()
-            elif self.worker.camera and self.worker.camera.IsOpen():
-                self.worker.camera.AcquisitionFrameRate.SetValue(value)
-                self.worker.set_target_fps(value)
-                actual_fps = self.worker.sync_camera_fps()
+                    self.worker.set_target_fps(value)
             else:
-                self.worker.set_target_fps(value)
-                actual_fps = None
+                actual_fps = self.worker.set_camera_frame_rate(value)
+                if actual_fps is None and not self.worker.is_genicam_camera():
+                    self.worker.set_target_fps(value)
+                actual_exposure_ms = self.worker.get_camera_exposure_ms()
 
             if actual_fps and abs(float(actual_fps) - float(value)) > 0.01:
-                self._on_status_update(f"FPS set to {value:.3f} (camera reports {actual_fps:.3f})")
+                self.spin_fps.blockSignals(True)
+                self.spin_fps.setValue(float(actual_fps))
+                self.spin_fps.blockSignals(False)
+
+            if actual_exposure_ms is not None and abs(float(actual_exposure_ms) - float(self.spin_exposure.value())) > 0.01:
+                self.spin_exposure.blockSignals(True)
+                self.spin_exposure.setValue(float(actual_exposure_ms))
+                self.spin_exposure.blockSignals(False)
+
+            if self.worker.is_spinnaker_camera():
+                throughput_limit = self.worker._read_numeric_node("DeviceLinkThroughputLimit")
+                throughput_max = self.worker._read_numeric_node("DeviceMaxThroughput")
+                if (
+                    throughput_limit is not None
+                    and throughput_max is not None
+                    and throughput_limit > 0
+                    and throughput_max > throughput_limit
+                ):
+                    throughput_suffix = f", transport limit {int(throughput_limit)}"
+
+            if actual_fps and abs(float(actual_fps) - float(value)) > 0.01:
+                message = f"FPS set to {float(actual_fps):.3f} (requested {value:.3f})"
+                if actual_exposure_ms is not None:
+                    message += f", exposure {float(actual_exposure_ms):.2f} ms"
+                self._on_status_update(message + throughput_suffix)
             else:
-                self._on_status_update(f"FPS set to {value:.3f}")
+                self._on_status_update(f"FPS set to {value:.3f}{throughput_suffix}")
         except Exception as e:
             self._on_error_occurred(f"Failed to set FPS: {str(e)}")
 
@@ -3840,6 +5017,12 @@ class MainWindow(QMainWindow):
                 actual_width = int(self.worker.usb_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
                 actual_height = int(self.worker.usb_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 self.worker.update_resolution(actual_width, actual_height)
+                self.spin_width.blockSignals(True)
+                self.spin_height.blockSignals(True)
+                self.spin_width.setValue(actual_width)
+                self.spin_height.setValue(actual_height)
+                self.spin_width.blockSignals(False)
+                self.spin_height.blockSignals(False)
                 self._on_status_update(f"Resolution set to {actual_width}x{actual_height}")
                 self._update_live_header(resolution_text=f"{actual_width} x {actual_height}")
                 self._update_advanced_controls_state()
@@ -3860,6 +5043,12 @@ class MainWindow(QMainWindow):
                 actual_width = int(flir_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 actual_height = int(flir_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 self.worker.update_resolution(actual_width, actual_height)
+                self.spin_width.blockSignals(True)
+                self.spin_height.blockSignals(True)
+                self.spin_width.setValue(actual_width)
+                self.spin_height.setValue(actual_height)
+                self.spin_width.blockSignals(False)
+                self.spin_height.blockSignals(False)
                 self._on_status_update(f"Resolution set to {actual_width}x{actual_height}")
                 self._update_live_header(resolution_text=f"{actual_width} x {actual_height}")
                 self._update_advanced_controls_state()
@@ -3867,34 +5056,39 @@ class MainWindow(QMainWindow):
                 self._on_error_occurred(f"Failed to set resolution: {str(e)}")
             return
 
-        if self.worker.camera and self.worker.camera.IsOpen():
+        if self.worker and self.worker.is_genicam_camera():
             try:
-                width = self.spin_width.value()
-                height = self.spin_height.value()
-
-                # Stop grabbing to change resolution
-                was_grabbing = self.worker.camera.IsGrabbing()
-                if was_grabbing:
-                    self.worker.camera.StopGrabbing()
-
-                for node_name in ("OffsetX", "OffsetY"):
-                    node = self._get_camera_node(node_name)
-                    if node and hasattr(node, "IsWritable") and node.IsWritable():
-                        node.SetValue(int(node.GetMin()))
-
-                width = self._clamp_int_node("Width", width)
-                height = self._clamp_int_node("Height", height)
-                if width is None or height is None:
+                applied = self.worker.set_camera_resolution(
+                    int(self.spin_width.value()),
+                    int(self.spin_height.value()),
+                )
+                if applied is None:
                     raise RuntimeError("Width/Height not supported by camera")
-
-                self.worker.camera.Width.SetValue(int(width))
-                self.worker.camera.Height.SetValue(int(height))
-                self.worker.update_resolution(width, height)
-
-                if was_grabbing:
-                    self.worker.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-
-                self._on_status_update(f"Resolution set to {width}x{height}")
+                width, height = applied
+                self.spin_width.blockSignals(True)
+                self.spin_height.blockSignals(True)
+                self.spin_width.setValue(int(width))
+                self.spin_height.setValue(int(height))
+                self.spin_width.blockSignals(False)
+                self.spin_height.blockSignals(False)
+                status_message = f"Resolution set to {width}x{height}"
+                actual_fps = self.worker.sync_camera_fps()
+                if actual_fps is not None:
+                    self.spin_fps.blockSignals(True)
+                    self.spin_fps.setValue(float(actual_fps))
+                    self.spin_fps.blockSignals(False)
+                    status_message += f", current FPS {float(actual_fps):.3f}"
+                if self.worker.is_spinnaker_camera():
+                    throughput_limit = self.worker._read_numeric_node("DeviceLinkThroughputLimit")
+                    throughput_max = self.worker._read_numeric_node("DeviceMaxThroughput")
+                    if (
+                        throughput_limit is not None
+                        and throughput_max is not None
+                        and throughput_limit > 0
+                        and throughput_max > throughput_limit
+                    ):
+                        status_message += f", transport limit {int(throughput_limit)}"
+                self._on_status_update(status_message)
                 self._update_live_header(resolution_text=f"{width} x {height}")
                 self._update_advanced_controls_state()
             except Exception as e:
@@ -3903,12 +5097,19 @@ class MainWindow(QMainWindow):
     @Slot(float)
     def _on_exposure_changed(self, value):
         """Handle exposure time change."""
-        if self.worker and self.worker.camera_type == "basler" and self.worker.camera:
+        if self.worker and self.worker.is_genicam_camera():
             try:
-                # Convert ms to microseconds
-                exposure_us = value * 1000.0
-                self.worker.camera.ExposureTime.SetValue(exposure_us)
-                self._on_status_update(f"Exposure set to {value:.2f} ms")
+                applied_ms = self.worker.set_camera_exposure_ms(value)
+                if applied_ms is None:
+                    raise RuntimeError("Exposure control not supported by camera")
+                actual_fps = self.worker.sync_camera_fps()
+                if actual_fps and abs(float(actual_fps) - float(self.spin_fps.value())) > 0.01:
+                    self.spin_fps.blockSignals(True)
+                    self.spin_fps.setValue(float(actual_fps))
+                    self.spin_fps.blockSignals(False)
+                    self._on_status_update(f"Exposure set to {applied_ms:.2f} ms, FPS now {float(actual_fps):.3f}")
+                else:
+                    self._on_status_update(f"Exposure set to {applied_ms:.2f} ms")
             except Exception as e:
                 self._on_error_occurred(f"Failed to set exposure: {str(e)}")
 
@@ -3919,6 +5120,53 @@ class MainWindow(QMainWindow):
             self.worker.set_image_format(format_text)
             self._save_ui_setting('image_format', format_text)
         self._update_live_header(mode_text=format_text)
+
+    def _update_preview_control_state(self):
+        """Keep preview controls aligned with the preview enable toggle."""
+        preview_enabled = self.check_preview_enabled.isChecked()
+        self.spin_preview_fps.setEnabled(preview_enabled)
+        self.spin_preview_width.setEnabled(preview_enabled)
+
+    def _on_preview_enabled_changed(self, enabled: bool):
+        """Enable or disable live preview while leaving acquisition running."""
+        self._update_preview_control_state()
+        if self.worker:
+            self.worker.set_preview_enabled(enabled)
+        if enabled:
+            self._on_status_update(f"Preview enabled at {self.spin_preview_fps.value():.1f} fps")
+        else:
+            self._on_status_update("Preview disabled; acquisition and recording continue")
+
+    def _on_preview_fps_changed(self, value: float):
+        """Set the preview cadence independent of the recording rate."""
+        if self.worker:
+            self.worker.set_preview_fps(value)
+        if self.check_preview_enabled.isChecked():
+            self._on_status_update(f"Preview FPS target: {value:.1f}")
+
+    def _on_preview_width_changed(self, value: int):
+        """Set the preview downscale target before frames reach the GUI."""
+        if self.worker:
+            self.worker.set_preview_max_width(value)
+        if value <= 0:
+            self._on_status_update("Preview width: full resolution")
+        else:
+            self._on_status_update(f"Preview max width: {int(value)} px")
+
+    def _on_frame_buffer_size_changed(self, value: int):
+        """Resize the internal queue and camera-side stream buffers."""
+        if self.worker:
+            self.worker.set_frame_buffer_size(value)
+        self._on_status_update(f"Frame buffer set to {int(value)} frames")
+
+    def _on_metadata_stats_interval_changed(self, value: int):
+        """Control how often raw frame statistics are computed."""
+        if self.worker:
+            self.worker.set_metadata_stats_interval(value)
+        if value <= 0:
+            self._on_status_update("Raw frame statistics disabled")
+        else:
+            self._on_status_update(f"Raw frame statistics every {int(value)} frames")
 
     def _toggle_advanced_settings(self):
         """Open or close the advanced camera popup."""
@@ -3933,7 +5181,7 @@ class MainWindow(QMainWindow):
 
     def _update_advanced_controls_state(self):
         """Update advanced controls based on camera availability."""
-        if not self.worker or self.worker.camera_type != "basler" or not self.worker.camera or not self.worker.camera.IsOpen():
+        if not self.worker or not self.worker.is_genicam_camera():
             self._set_advanced_controls_enabled(False)
             return
 
@@ -3943,31 +5191,33 @@ class MainWindow(QMainWindow):
         self._configure_int_node("OffsetY", self.slider_offset_y, self.spin_offset_y)
 
         self._configure_float_node("Gain", self.spin_gain)
+        self._configure_white_balance_controls()
         if not self._configure_float_node("Brightness", self.spin_brightness):
             self._configure_float_node("BlackLevel", self.spin_brightness)
         if not self._configure_float_node("Contrast", self.spin_contrast):
             self._configure_float_node("Gamma", self.spin_contrast)
 
-        if self.settings.contains('offset_x') and self.settings.contains('offset_y'):
-            try:
-                self._on_offset_x_changed(int(self.settings.value('offset_x')))
-                self._on_offset_y_changed(int(self.settings.value('offset_y')))
-            except Exception:
+        if self.spin_offset_x.isEnabled() and self.spin_offset_y.isEnabled():
+            if self.settings.contains('offset_x') and self.settings.contains('offset_y'):
+                try:
+                    self._on_offset_x_changed(int(self.settings.value('offset_x')))
+                    self._on_offset_y_changed(int(self.settings.value('offset_y')))
+                except Exception:
+                    self._center_offsets()
+            else:
                 self._center_offsets()
-        else:
-            self._center_offsets()
 
-        if self.settings.contains('gain'):
+        if self.spin_gain.isEnabled() and self.settings.contains('gain'):
             try:
                 self._on_gain_changed(float(self.settings.value('gain')))
             except Exception:
                 pass
-        if self.settings.contains('brightness'):
+        if self.spin_brightness.isEnabled() and self.settings.contains('brightness'):
             try:
                 self._on_brightness_changed(float(self.settings.value('brightness')))
             except Exception:
                 pass
-        if self.settings.contains('contrast'):
+        if self.spin_contrast.isEnabled() and self.settings.contains('contrast'):
             try:
                 self._on_contrast_changed(float(self.settings.value('contrast')))
             except Exception:
@@ -3996,13 +5246,67 @@ class MainWindow(QMainWindow):
             self.slider_offset_x, self.spin_offset_x,
             self.slider_offset_y, self.spin_offset_y,
             self.btn_center_offsets,
-            self.spin_gain, self.spin_brightness, self.spin_contrast,
+            self.spin_gain,
+            self.combo_white_balance_auto,
+            self.spin_white_balance_red,
+            self.spin_white_balance_blue,
+            self.spin_brightness,
+            self.spin_contrast,
         ):
             widget.setEnabled(enabled)
 
+    def _configure_white_balance_controls(self):
+        """Populate white-balance controls when the camera exposes them."""
+        auto_node = self._get_camera_node("BalanceWhiteAuto")
+        ratio_node = self._get_camera_node("BalanceRatio")
+        if auto_node is None or ratio_node is None or self.worker is None:
+            self.combo_white_balance_auto.setEnabled(False)
+            self.spin_white_balance_red.setEnabled(False)
+            self.spin_white_balance_blue.setEnabled(False)
+            return False
+
+        auto_mode = self.worker._read_enum_node_symbolic("BalanceWhiteAuto") or "Continuous"
+        if auto_mode not in {"Continuous", "Off"}:
+            auto_mode = "Continuous"
+        self.combo_white_balance_auto.blockSignals(True)
+        self.combo_white_balance_auto.setCurrentText(auto_mode)
+        self.combo_white_balance_auto.blockSignals(False)
+        self.combo_white_balance_auto.setEnabled(self.worker._node_is_writable(auto_node))
+
+        min_ratio = 0.25
+        max_ratio = 4.0
+        ratio_inc = 0.0001
+        try:
+            min_ratio = float(ratio_node.GetMin())
+            max_ratio = float(ratio_node.GetMax())
+        except Exception:
+            pass
+        try:
+            ratio_inc = max(float(ratio_node.GetInc()), 0.0001)
+        except Exception:
+            pass
+
+        for selector, spin in (("Red", self.spin_white_balance_red), ("Blue", self.spin_white_balance_blue)):
+            ratio_value = self.worker.get_camera_white_balance_ratio(selector)
+            spin.blockSignals(True)
+            spin.setRange(min_ratio, max_ratio)
+            spin.setSingleStep(ratio_inc)
+            if ratio_value is not None:
+                spin.setValue(float(ratio_value))
+            spin.blockSignals(False)
+
+        manual_enabled = auto_mode == "Off" and self.worker._node_is_writable(ratio_node)
+        self.spin_white_balance_red.setEnabled(manual_enabled)
+        self.spin_white_balance_blue.setEnabled(manual_enabled)
+        return True
+
     def _configure_int_node(self, node_name: str, slider: QSlider, spin: QSpinBox):
         node = self._get_camera_node(node_name)
-        if not node:
+        if not node or (self.worker and not self.worker._node_is_readable(node)):
+            slider.setEnabled(False)
+            spin.setEnabled(False)
+            return False
+        if self.worker and not self.worker._node_is_writable(node):
             slider.setEnabled(False)
             spin.setEnabled(False)
             return False
@@ -4026,12 +5330,9 @@ class MainWindow(QMainWindow):
         if not node:
             spin.setEnabled(False)
             return False
-        try:
-            if hasattr(node, "IsWritable") and not node.IsWritable():
-                spin.setEnabled(False)
-                return False
-        except Exception:
-            pass
+        if self.worker and not self.worker._node_is_writable(node):
+            spin.setEnabled(False)
+            return False
 
         min_val = float(node.GetMin())
         max_val = float(node.GetMax())
@@ -4053,56 +5354,29 @@ class MainWindow(QMainWindow):
         return True
 
     def _get_camera_node(self, node_name: str):
-        if not self.worker or not self.worker.camera:
+        if not self.worker or not self.worker.is_genicam_camera():
             return None
-        try:
-            node = getattr(self.worker.camera, node_name)
-        except Exception:
-            return None
-        try:
-            if hasattr(node, "IsReadable") and not node.IsReadable():
-                return None
-        except Exception:
+        node = self.worker._get_camera_node(node_name)
+        if node is None or not self.worker._node_is_readable(node):
             return None
         return node
 
     def _clamp_int_node(self, node_name: str, value: int):
-        node = self._get_camera_node(node_name)
-        if not node:
+        if not self.worker:
             return None
-        try:
-            if hasattr(node, "IsWritable") and not node.IsWritable():
-                return None
-        except Exception:
-            pass
-        try:
-            min_val = int(node.GetMin())
-            max_val = int(node.GetMax())
-            inc = int(node.GetInc()) if hasattr(node, "GetInc") else 1
-        except Exception:
-            return None
-        value = max(min_val, min(max_val, int(value)))
-        if inc > 1:
-            value = min_val + ((value - min_val) // inc) * inc
-        return value
+        return self.worker._clamp_numeric_node_value(node_name, value, integer=True)
 
     def _set_camera_int_node(self, node_name: str, value: int):
-        node = self._get_camera_node(node_name)
-        if not node:
+        if not self.worker:
             return
-        try:
-            node.SetValue(int(value))
-        except Exception as e:
-            self._on_error_occurred(f"Failed to set {node_name}: {str(e)}")
+        if self.worker._write_numeric_node(node_name, value, integer=True) is None:
+            self._on_error_occurred(f"Failed to set {node_name}: unsupported by camera")
 
     def _set_camera_float_node(self, node_name: str, value: float):
-        node = self._get_camera_node(node_name)
-        if not node:
+        if not self.worker:
             return
-        try:
-            node.SetValue(float(value))
-        except Exception as e:
-            self._on_error_occurred(f"Failed to set {node_name}: {str(e)}")
+        if self.worker._write_numeric_node(node_name, value, integer=False) is None:
+            self._on_error_occurred(f"Failed to set {node_name}: unsupported by camera")
 
     def _sync_offset_controls(self, value: int, slider: QSlider, spin: QSpinBox):
         if slider.value() != value:
@@ -4143,8 +5417,42 @@ class MainWindow(QMainWindow):
         self._on_offset_y_changed(centered_y)
 
     def _on_gain_changed(self, value: float):
-        self._set_camera_float_node("Gain", value)
+        if self.worker and self.worker.is_genicam_camera():
+            applied = self.worker.set_camera_gain(value)
+            if applied is None:
+                self._on_error_occurred("Failed to set Gain: unsupported by camera")
+            else:
+                self._on_status_update(f"Gain set to {applied:.2f} dB")
         self._save_ui_setting('gain', value)
+
+    def _on_white_balance_auto_changed(self, mode: str):
+        if not self.worker or not self.worker.is_genicam_camera():
+            return
+        if not self.worker.set_camera_white_balance_auto(mode):
+            self._on_error_occurred("Failed to set White Balance mode")
+            return
+        self._configure_white_balance_controls()
+        self._on_status_update(f"White balance set to {mode}")
+
+    def _on_white_balance_red_changed(self, value: float):
+        if not self.worker or not self.worker.is_genicam_camera():
+            return
+        applied = self.worker.set_camera_white_balance_ratio("Red", value)
+        if applied is None:
+            self._on_error_occurred("Failed to set red white-balance ratio")
+            return
+        self._configure_white_balance_controls()
+        self._on_status_update(f"WB Red set to {applied:.4f}")
+
+    def _on_white_balance_blue_changed(self, value: float):
+        if not self.worker or not self.worker.is_genicam_camera():
+            return
+        applied = self.worker.set_camera_white_balance_ratio("Blue", value)
+        if applied is None:
+            self._on_error_occurred("Failed to set blue white-balance ratio")
+            return
+        self._configure_white_balance_controls()
+        self._on_status_update(f"WB Blue set to {applied:.4f}")
 
     def _on_brightness_changed(self, value: float):
         if not self._get_camera_node("Brightness"):
@@ -4769,7 +6077,12 @@ class MainWindow(QMainWindow):
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def _current_recording_elapsed_seconds(self) -> int:
-        """Return elapsed recording time in whole seconds."""
+        """Return elapsed encoded video time in whole seconds."""
+        if self.worker is not None and self.worker.is_recording:
+            reference_fps = self._get_recording_reference_fps()
+            if reference_fps > 0:
+                recorded_frames = max(0, int(getattr(self.worker, "frame_counter", 0)))
+                return max(0, int(recorded_frames / reference_fps))
         if not self.recording_start_time:
             return 0
         return max(0, int((datetime.now() - self.recording_start_time).total_seconds()))
