@@ -1,8 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import importlib.util
 import os
 import sys
-from PyInstaller.utils.hooks import collect_data_files
+from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 base_prefix = sys.base_prefix
 dll_dirs = [
@@ -42,15 +45,46 @@ branding_datas = [
     ("assets/camapp_icon.png", "assets"),
     ("assets/camapp_splash.png", "assets"),
 ]
+pyspin_datas = []
+pyspin_binaries = []
+pyspin_hiddenimports = []
+
+
+def _resolve_installed_pyspin_package_dir():
+    """Find the real installed PySpin package, not the repo's wheel cache folder."""
+    try:
+        spec = importlib.util.find_spec("PySpin")
+    except Exception:
+        return None
+    if spec is None:
+        return None
+
+    origin = getattr(spec, "origin", None)
+    if origin and origin not in {"built-in", "namespace"}:
+        package_dir = Path(origin).resolve().parent
+        if (package_dir / "__init__.py").is_file() and (package_dir / "PySpin.py").is_file():
+            return package_dir
+
+    for search_location in getattr(spec, "submodule_search_locations", []) or []:
+        package_dir = Path(search_location).resolve()
+        if (package_dir / "__init__.py").is_file() and (package_dir / "PySpin.py").is_file():
+            return package_dir
+
+    return None
+
+
+installed_pyspin_dir = _resolve_installed_pyspin_package_dir()
+if installed_pyspin_dir is not None:
+    pyspin_datas, pyspin_binaries, pyspin_hiddenimports = collect_all("PySpin", include_py_files=True)
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=extra_binaries,
-    datas=qt_datas + branding_datas,
+    binaries=extra_binaries + pyspin_binaries,
+    datas=qt_datas + branding_datas + pyspin_datas,
     hiddenimports=[
         "PySide6.QtOpenGL",
-    ],
+    ] + pyspin_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

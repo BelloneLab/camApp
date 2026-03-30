@@ -64,6 +64,7 @@ For FLIR machine-vision cameras such as Blackfly / Chameleon / Grasshopper:
 Notes:
 
 - `PySpin` is not installed from `requirements.txt`; the wheel must come from the Spinnaker SDK package and must match your Python version and architecture.
+- The repository's top-level `PySpin/` folder is only a local cache for vendor wheels and docs; it is not the installed Spinnaker Python package.
 - If `PySpin` imports fail with `_ARRAY_API not found` or `numpy.core.multiarray failed to import`, the environment is using NumPy 2.x; downgrade to `numpy<2`.
 - `simple_pyspin` and `EasyPySpin` are useful for standalone diagnostics, but CamApp uses raw `PySpin` directly so the app can manage acquisition and GenICam nodes itself.
 
@@ -130,6 +131,14 @@ python -m pip install -r requirements.txt pyinstaller
 .\scripts\build_release.ps1 -Version dev -PythonExe python -Clean
 ```
 
+If FLIR Spinnaker support matters in the compiled EXE, build with the same interpreter that already passes `import PySpin` and can see the camera, for example:
+
+```powershell
+.\scripts\build_release.ps1 -Version dev -PythonExe C:\Users\bellone\.conda\envs\CamApp\python.exe -Clean
+```
+
+The build script prints the exact interpreter path plus a `PySpin` preflight result before packaging.
+
 That produces:
 
 - `dist/CamApp.exe`
@@ -137,7 +146,7 @@ That produces:
 - `release/CamApp-dev-windows-x64.sha256`
 - `release/CamApp-dev-windows-x64-warn.txt`
 
-Note: the compiled EXE still requires FFmpeg available on PATH at runtime. FLIR Spinnaker support also still requires the vendor SDK and `PySpin` on the target machine; the GitHub build does not bundle the Spinnaker SDK.
+Note: the compiled EXE still requires FFmpeg available on PATH at runtime. Local builds bundle `PySpin` only when the selected build interpreter already has the real vendor package installed. The GitHub build still does not bundle the Spinnaker SDK because the CI environment does not install the vendor wheel.
 
 ## GitHub Release Workflow
 

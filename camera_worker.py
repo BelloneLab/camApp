@@ -23,6 +23,7 @@ from camera_backends import (
     TeaxGrabber,
     pylon,
 )
+from config import CAMERA_CONFIG
 
 
 @dataclass
@@ -64,6 +65,7 @@ class CameraWorker(QThread):
         self.pyspin_cam_list: Optional[Any] = None
         self.pyspin_image_processor: Optional[Any] = None
         self.camera_type: Optional[str] = None
+        self.basler_device_class = ""
         self.flir_backend: Optional[str] = None
         self.flir_video_index: Optional[int] = None
         self.flir_serial_port: Optional[str] = None
@@ -185,15 +187,59 @@ class CameraWorker(QThread):
         self.processing_queue_max_frames = frame_value
         self.stream_buffer_target = max(32, frame_value)
 
+        effective_capacity = self._get_effective_processing_queue_capacity()
         with self.processing_condition:
-            while len(self.processing_queue) > self.processing_queue_max_frames:
+            while len(self.processing_queue) > effective_capacity:
                 self.processing_queue.popleft()
                 self.processing_queue_drop_count += 1
             self.processing_condition.notify_all()
 
         if self.is_spinnaker_camera():
             self._configure_spinnaker_stream()
+        elif self.camera_type == "basler" and self.camera and self.camera.IsOpen():
+            self._configure_basler_stream_buffers()
         self._emit_processing_buffer_usage()
+
+    def _is_basler_gige_camera(self) -> bool:
+        """True when the connected Basler camera uses the GigE transport."""
+        return self.camera_type == "basler" and "gige" in str(self.basler_device_class or "").lower()
+
+    def _get_effective_processing_queue_capacity(self) -> int:
+        """Clamp live frame buffering to avoid runaway memory on high-rate cameras."""
+        requested = max(8, int(self.processing_queue_max_frames))
+        if self._is_basler_gige_camera():
+            return min(requested, 32)
+        return requested
+
+    def _get_basler_camera_buffer_target(self) -> int:
+        """Size Basler SDK buffers conservatively for real-time recording stability."""
+        target = self._get_effective_processing_queue_capacity()
+        if self._is_basler_gige_camera():
+            return min(target, 32)
+        return min(target, 64)
+
+    def _configure_basler_stream_buffers(self):
+        """Apply a conservative Basler camera-side buffer depth."""
+        if self.camera_type != "basler" or not self.camera or not self.camera.IsOpen():
+            return
+        try:
+            target = int(self._get_basler_camera_buffer_target())
+            if hasattr(self.camera, "MaxNumBuffer"):
+                try:
+                    self.camera.MaxNumBuffer.SetValue(target)
+                except Exception:
+                    self.camera.MaxNumBuffer = target
+        except Exception:
+            pass
+
+    def _get_basler_grab_strategy(self):
+        """Pick a grab strategy that favors live stability over unbounded backlog."""
+        if self._is_basler_gige_camera():
+            return pylon.GrabStrategy_LatestImageOnly
+        strategy_name = str(CAMERA_CONFIG.get("grab_strategy", "LatestImageOnly") or "").strip().lower()
+        if strategy_name == "onebyone":
+            return pylon.GrabStrategy_OneByOne
+        return pylon.GrabStrategy_LatestImageOnly
 
     def _reset_frame_drop_stats(self):
         """Reset frame-timing counters for a new recording session."""
@@ -343,28 +389,27 @@ class CameraWorker(QThread):
         """Publish internal processing queue occupancy as a percentage."""
         with self.processing_condition:
             queue_len = len(self.processing_queue)
-            capacity = max(1, int(self.processing_queue_max_frames))
+            capacity = max(1, int(self._get_effective_processing_queue_capacity()))
         usage = int(min(100.0, (100.0 * queue_len) / float(capacity)))
         self.buffer_update.emit(usage)
 
     def _enqueue_frame_packet(self, packet: FramePacket) -> bool:
         """Push a captured frame into the processing queue."""
-        deadline = time.monotonic() + 0.25
         dropped = False
         with self.processing_condition:
-            while self.running and len(self.processing_queue) >= self.processing_queue_max_frames:
+            capacity = max(1, int(self._get_effective_processing_queue_capacity()))
+            while self.running and len(self.processing_queue) >= capacity:
                 if not self.is_recording:
                     self.processing_queue.popleft()
                     self.processing_queue_drop_count += 1
                     dropped = True
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if self._is_basler_gige_camera():
                     self.processing_queue.popleft()
                     self.processing_queue_drop_count += 1
                     dropped = True
                     break
-                self.processing_condition.wait(timeout=min(0.02, remaining))
+                self.processing_condition.wait(timeout=0.01)
 
             if not self.running:
                 return False
@@ -1112,7 +1157,7 @@ class CameraWorker(QThread):
                     if self.is_spinnaker_camera():
                         self.camera.BeginAcquisition()
                     else:
-                        self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                        self.camera.StartGrabbing(self._get_basler_grab_strategy())
             except Exception:
                 pass
 
@@ -1165,15 +1210,17 @@ class CameraWorker(QThread):
 
             index = int(camera_info.get("index", 0))
             index = max(0, min(index, len(devices) - 1))
-            self.camera = pylon.InstantCamera(tlFactory.CreateDevice(devices[index]))
+            selected_device = devices[index]
+            try:
+                self.basler_device_class = str(selected_device.GetDeviceClass() or "")
+            except Exception:
+                self.basler_device_class = ""
+
+            self.camera = pylon.InstantCamera(tlFactory.CreateDevice(selected_device))
             self.camera.Open()
             self.camera_type = "basler"
 
-            # Configure camera
-            try:
-                self.camera.MaxNumBuffer = int(self.processing_queue_max_frames)
-            except Exception:
-                pass
+            self._configure_basler_stream_buffers()
 
             # Apply image format
             self.set_image_format(self.image_format)
@@ -1195,6 +1242,24 @@ class CameraWorker(QThread):
                 self.camera.ChunkEnable.SetValue(True)
             except:
                 pass  # Not all cameras support this
+
+            if self._is_basler_gige_camera():
+                try:
+                    packet_size = int(CAMERA_CONFIG.get("gige_packet_size", 1500))
+                    if hasattr(self.camera, "GevSCPSPacketSize"):
+                        packet_size = max(
+                            int(self.camera.GevSCPSPacketSize.GetMin()),
+                            min(int(self.camera.GevSCPSPacketSize.GetMax()), packet_size),
+                        )
+                        self.camera.GevSCPSPacketSize.SetValue(packet_size)
+                except Exception:
+                    pass
+                effective_capacity = self._get_effective_processing_queue_capacity()
+                self.status_update.emit(
+                    f"Basler GigE camera connected: {self.width}x{self.height} "
+                    f"(live queue capped at {effective_capacity} frames)"
+                )
+                return True
 
             self.status_update.emit(f"Basler camera connected: {self.width}x{self.height}")
             return True
@@ -1627,6 +1692,7 @@ class CameraWorker(QThread):
                 self.usb_capture = None
             self._close_flir_camera()
             self.camera_type = None
+            self.basler_device_class = ""
             self.flir_backend = None
             self.flir_video_index = None
             self.flir_serial_port = None
@@ -1899,12 +1965,8 @@ class CameraWorker(QThread):
             self.running = True
             self._start_processing_thread()
             if self.camera_type == "basler":
-                try:
-                    if hasattr(self.camera, "MaxNumBuffer"):
-                        self.camera.MaxNumBuffer.SetValue(int(self.processing_queue_max_frames))
-                except Exception:
-                    pass
-                self.camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+                self._configure_basler_stream_buffers()
+                self.camera.StartGrabbing(self._get_basler_grab_strategy())
 
                 while self.running:
                     try:

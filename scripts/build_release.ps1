@@ -39,6 +39,62 @@ if ($Clean) {
 
 New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
 
+$probeScript = @'
+import importlib
+import importlib.util
+import json
+import sys
+
+result = {
+    "python": sys.executable,
+    "version": sys.version.split()[0],
+    "pyspin_origin": None,
+    "pyspin_search_locations": [],
+    "pyspin_usable": False,
+    "pyspin_error": "",
+}
+
+try:
+    spec = importlib.util.find_spec("PySpin")
+except Exception as exc:
+    spec = None
+    result["pyspin_error"] = repr(exc)
+else:
+    if spec is not None:
+        result["pyspin_origin"] = spec.origin
+        result["pyspin_search_locations"] = list(getattr(spec, "submodule_search_locations", []) or [])
+
+try:
+    module = importlib.import_module("PySpin")
+    if hasattr(module, "System"):
+        result["pyspin_usable"] = True
+    else:
+        module = importlib.import_module("PySpin.PySpin")
+        result["pyspin_usable"] = hasattr(module, "System")
+except Exception as exc:
+    if not result["pyspin_error"]:
+        result["pyspin_error"] = repr(exc)
+
+print(json.dumps(result))
+'@
+
+$probeJson = $probeScript | & $PythonExe -
+if ($LASTEXITCODE -ne 0) {
+    throw "Python preflight probe failed for $PythonExe"
+}
+
+$probe = $probeJson | ConvertFrom-Json
+Write-Host "Build interpreter: $($probe.python) [$($probe.version)]"
+if ($probe.pyspin_usable) {
+    Write-Host "PySpin probe: usable"
+} elseif ($probe.pyspin_origin -or ($probe.pyspin_search_locations | Measure-Object).Count -gt 0) {
+    Write-Warning ("PySpin is visible to the build interpreter but not usable. " +
+        "FLIR Spinnaker cameras will not work in the compiled EXE. " +
+        "Origin: {0}. Error: {1}" -f $probe.pyspin_origin, $probe.pyspin_error)
+} else {
+    Write-Host "PySpin probe: not installed in the build interpreter"
+}
+
 $pyInstallerArgs = @("-m", "PyInstaller", "--noconfirm")
 if ($Clean) {
     $pyInstallerArgs += "--clean"

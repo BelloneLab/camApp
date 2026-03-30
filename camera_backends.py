@@ -6,6 +6,7 @@ start even when vendor SDKs are not installed.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import sys
@@ -25,13 +26,160 @@ else:
 pylon = _pylon
 PYPYLON_AVAILABLE = pylon is not None
 
-try:
-    import PySpin as _PySpin
-except Exception as exc:  # pragma: no cover - depends on local SDK install
-    _PySpin = None
-    PYSPIN_IMPORT_ERROR = exc
-else:
-    PYSPIN_IMPORT_ERROR = None
+_PYSPIN_DLL_DIR_HANDLES: List[object] = []
+PYSPIN_PACKAGE_DIR = ""
+
+
+def _is_real_pyspin_package_dir(package_dir: Optional[Path]) -> bool:
+    """True when package_dir looks like an installed PySpin package."""
+    if package_dir is None or not package_dir.is_dir():
+        return False
+    return (package_dir / "__init__.py").is_file() and (package_dir / "PySpin.py").is_file()
+
+
+def _resolve_pyspin_package_dir() -> Optional[Path]:
+    """Locate the real installed PySpin package, not the repo's wheel cache folder."""
+    try:
+        spec = importlib.util.find_spec("PySpin")
+    except Exception:
+        return None
+    if spec is None:
+        return None
+
+    origin = getattr(spec, "origin", None)
+    if origin and origin not in {"built-in", "namespace"}:
+        package_dir = Path(origin).resolve().parent
+        if _is_real_pyspin_package_dir(package_dir):
+            return package_dir
+
+    for search_location in getattr(spec, "submodule_search_locations", []) or []:
+        package_dir = Path(search_location).resolve()
+        if _is_real_pyspin_package_dir(package_dir):
+            return package_dir
+
+    return None
+
+
+def _append_path_env(env_var: str, directories: List[Path]) -> None:
+    """Append unique directories to a PATH-like environment variable."""
+    current_entries = [
+        os.path.normcase(os.path.abspath(entry))
+        for entry in os.environ.get(env_var, "").split(os.pathsep)
+        if entry
+    ]
+    updated_entries = list(os.environ.get(env_var, "").split(os.pathsep)) if os.environ.get(env_var) else []
+    for directory in directories:
+        normalized = os.path.normcase(os.path.abspath(str(directory)))
+        if normalized in current_entries:
+            continue
+        current_entries.append(normalized)
+        updated_entries.append(str(directory))
+    if updated_entries:
+        os.environ[env_var] = os.pathsep.join(updated_entries)
+
+
+def _iter_spinnaker_runtime_dirs(pyspin_package_dir: Optional[Path]) -> List[Path]:
+    """Collect candidate DLL / CTI directories for Spinnaker."""
+    candidates: List[Path] = []
+    if pyspin_package_dir is not None:
+        candidates.append(pyspin_package_dir)
+
+    if os.name == "nt":
+        root_candidates: List[Path] = []
+        for env_var in ("SPINNAKER_ROOT", "SPINNAKER_HOME"):
+            raw_path = os.environ.get(env_var, "").strip()
+            if raw_path:
+                root_candidates.append(Path(raw_path))
+        root_candidates.extend(
+            [
+                Path(r"C:\Program Files\FLIR Systems\Spinnaker"),
+                Path(r"C:\Program Files\Teledyne FLIR\Spinnaker"),
+                Path(r"C:\Program Files\TeledyneFLIR\Spinnaker"),
+                Path(r"C:\Program Files\Teledyne FLIR IIS\Spinnaker"),
+            ]
+        )
+        for root_dir in root_candidates:
+            candidates.extend(
+                [
+                    root_dir / "bin64" / "vs2015",
+                    root_dir / "bin" / "vs2015",
+                    root_dir / "dependencies" / "GenICam_v3_0" / "bin" / "Win64_x64" / "msvc2015",
+                    root_dir / "cti64" / "vs2015",
+                    root_dir / "cti" / "vs2015",
+                ]
+            )
+
+    unique_candidates: List[Path] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if not resolved.is_dir():
+            continue
+        normalized = os.path.normcase(str(resolved))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_candidates.append(resolved)
+    return unique_candidates
+
+
+def _configure_pyspin_runtime(pyspin_package_dir: Optional[Path]) -> None:
+    """Prime DLL and GenTL search paths before importing PySpin."""
+    runtime_dirs = _iter_spinnaker_runtime_dirs(pyspin_package_dir)
+    if not runtime_dirs:
+        return
+
+    _append_path_env("PATH", runtime_dirs)
+
+    cti_dirs = [directory for directory in runtime_dirs if any(directory.glob("*.cti"))]
+    if cti_dirs:
+        _append_path_env("GENICAM_GENTL64_PATH", cti_dirs)
+
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+
+    for runtime_dir in runtime_dirs:
+        try:
+            handle = os.add_dll_directory(str(runtime_dir))
+        except (FileNotFoundError, OSError):
+            continue
+        _PYSPIN_DLL_DIR_HANDLES.append(handle)
+
+
+def _import_pyspin() -> Tuple[Optional[object], Optional[Exception], Optional[Path]]:
+    """Import the real PySpin API, not a namespace-only placeholder."""
+    pyspin_package_dir = _resolve_pyspin_package_dir()
+    _configure_pyspin_runtime(pyspin_package_dir)
+
+    last_error: Optional[Exception] = None
+    for module_name in ("PySpin", "PySpin.PySpin"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # pragma: no cover - depends on local SDK install
+            last_error = exc
+            continue
+        if hasattr(module, "System"):
+            if pyspin_package_dir is None:
+                module_file = getattr(module, "__file__", None)
+                if module_file:
+                    candidate_dir = Path(module_file).resolve().parent
+                    if _is_real_pyspin_package_dir(candidate_dir):
+                        pyspin_package_dir = candidate_dir
+            return module, None, pyspin_package_dir
+        last_error = RuntimeError(
+            f"{module_name} loaded from "
+            f"'{getattr(module, '__file__', None) or 'namespace package'}' "
+            "but does not expose the Spinnaker API."
+        )
+    return None, last_error, pyspin_package_dir
+
+
+_PySpin, PYSPIN_IMPORT_ERROR, _PYSPIN_PACKAGE_DIR = _import_pyspin()
+if _PYSPIN_PACKAGE_DIR is not None:
+    PYSPIN_PACKAGE_DIR = str(_PYSPIN_PACKAGE_DIR)
 
 PySpin = _PySpin
 PYSPIN_AVAILABLE = PySpin is not None
@@ -290,6 +438,20 @@ def _build_pyspin_import_diagnostic(import_error: Optional[Exception]) -> str:
     """Explain why PySpin is unavailable in the current interpreter."""
     import_error_text = str(import_error or "")
     lowered_error = import_error_text.lower()
+    if "does not expose the spinnaker api" in lowered_error or "cannot import name 'pyspin'" in lowered_error:
+        return (
+            "CamApp found a local 'PySpin' folder, but not the installed Spinnaker "
+            "Python package. Install the vendor PySpin wheel into the Python "
+            "environment used to launch or build CamApp."
+        )
+    if "dll load failed" in lowered_error or "the specified module could not be found" in lowered_error:
+        package_hint = f" Detected PySpin package: {PYSPIN_PACKAGE_DIR}." if PYSPIN_PACKAGE_DIR else ""
+        return (
+            "PySpin was found, but its native Spinnaker DLLs did not load. Reinstall "
+            "the matching Spinnaker SDK / PySpin wheel or rebuild CamApp from the same "
+            "environment that can import PySpin successfully."
+            f"{package_hint}"
+        )
     if (
         "_array_api" in lowered_error
         or "numpy.core.multiarray failed to import" in lowered_error
