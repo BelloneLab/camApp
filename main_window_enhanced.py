@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 import os
 import re
+import sys
 import cv2
 from typing import Optional, Dict, List
 from camera_backends import (
@@ -1029,6 +1030,11 @@ class MainWindow(QMainWindow):
         self.label_camera_source_hint = QLabel("No source connected")
         self.label_camera_source_hint.setStyleSheet("color: #8fa6bf;")
         hero_layout.addWidget(self.label_camera_source_hint)
+
+        self.label_camera_scan_diagnostics = QLabel("Scan not run yet")
+        self.label_camera_scan_diagnostics.setWordWrap(True)
+        self.label_camera_scan_diagnostics.setStyleSheet("color: #6f859d; font-size: 10px;")
+        hero_layout.addWidget(self.label_camera_scan_diagnostics)
 
         layout.addWidget(hero)
         layout.addStretch()
@@ -3462,26 +3468,57 @@ class MainWindow(QMainWindow):
         """Scan for Basler, FLIR, and generic USB cameras."""
         self.combo_camera.clear()
         cameras = []
+        scan_details: List[str] = []
+        basler_scan_error = ""
 
         try:
             basler_cameras = discover_basler_cameras()
         except Exception as e:
             basler_cameras = []
+            basler_scan_error = str(e)
             if hasattr(self, "status_bar"):
-                self._on_status_update(f"Basler scan error: {str(e)}")
+                self._on_status_update(f"Basler scan error: {basler_scan_error}")
 
         flir_cameras, reserved_usb_indices = discover_flir_cameras()
         usb_cameras = discover_usb_cameras(skip_indices=reserved_usb_indices)
         backend_diagnostics = get_camera_backend_diagnostics()
+        scan_details.append(f"Basler {len(basler_cameras)}")
+        scan_details.append(f"FLIR {len(flir_cameras)}")
+        scan_details.append(f"USB {len(usb_cameras)}")
 
         for camera_info in basler_cameras + flir_cameras + usb_cameras:
             self.combo_camera.addItem(camera_info.get("label", "Camera"), camera_info)
             cameras.append(camera_info)
 
+        pypylon_diag = backend_diagnostics.get("pypylon", "")
+        if not basler_cameras and pypylon_diag and hasattr(self, "status_bar"):
+            self._on_status_update(f"Basler unavailable: {pypylon_diag}")
+
         if not any(cam.get("backend") == "spinnaker" for cam in flir_cameras):
             pyspin_diag = backend_diagnostics.get("pyspin", "")
             if pyspin_diag and hasattr(self, "status_bar"):
                 self._on_status_update(f"FLIR Spinnaker unavailable: {pyspin_diag}")
+        else:
+            pyspin_diag = ""
+
+        detail_lines = [f"Scan: {', '.join(scan_details)}"]
+        runtime_name = Path(sys.executable).name
+        runtime_mode = "frozen" if getattr(sys, "frozen", False) else "python"
+        detail_lines.append(f"Runtime: {runtime_name} ({runtime_mode})")
+        if basler_scan_error:
+            detail_lines.append(f"Basler scan error: {basler_scan_error}")
+        elif pypylon_diag:
+            detail_lines.append(f"Basler backend: {pypylon_diag}")
+        elif not basler_cameras:
+            detail_lines.append("Basler backend loaded but returned 0 devices.")
+        if pyspin_diag:
+            detail_lines.append(f"FLIR backend: {pyspin_diag}")
+
+        summary_text = f"{detail_lines[0]}."
+        if not cameras:
+            summary_text = f"No cameras detected. {detail_lines[0]}."
+        self.label_camera_scan_diagnostics.setText(summary_text)
+        self.label_camera_scan_diagnostics.setToolTip("\n".join(detail_lines))
 
         if not cameras:
             self.combo_camera.addItem("No cameras detected", None)

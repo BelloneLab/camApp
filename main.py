@@ -25,8 +25,12 @@ def _is_existing_dir(path_value: str | None) -> bool:
 
 def _prefer_environment_site_packages() -> None:
     """
-    In conda/venv, prefer environment packages over user-site packages.
-    This avoids loading mismatched Qt wheels from %APPDATA%.
+    In conda/venv, keep environment packages ahead of user-site packages.
+
+    We used to drop user-site entirely to avoid loading mismatched Qt wheels
+    from %APPDATA%, but that also hid optional SDK packages such as pypylon
+    when they were installed only per-user. Reordering keeps the environment
+    preferred while preserving those fallbacks.
     """
     in_managed_env = bool(os.environ.get("CONDA_PREFIX")) or sys.prefix != sys.base_prefix
     if not in_managed_env:
@@ -46,12 +50,20 @@ def _prefer_environment_site_packages() -> None:
         return
 
     normalized_user_sites = {os.path.normcase(os.path.abspath(p)) for p in user_sites}
-    sys.path[:] = [
-        p
-        for p in sys.path
-        if os.path.normcase(os.path.abspath(p)) not in normalized_user_sites
-    ]
-    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+    regular_paths: list[str] = []
+    user_site_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for path_entry in sys.path:
+        normalized_entry = os.path.normcase(os.path.abspath(path_entry))
+        if normalized_entry in seen_paths:
+            continue
+        seen_paths.add(normalized_entry)
+        if normalized_entry in normalized_user_sites:
+            user_site_paths.append(path_entry)
+        else:
+            regular_paths.append(path_entry)
+
+    sys.path[:] = regular_paths + user_site_paths
 
 
 def _find_frozen_qt_plugins_dir() -> Path | None:
